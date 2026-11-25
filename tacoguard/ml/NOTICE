@@ -1,0 +1,18 @@
+TacoGuard machine-learning features (tacoguard/ml)
+
+features.py and pefile_warnings.txt come from EMBER2024 ("thrember", feature version 3):
+    https://github.com/FutureComputing4AI/EMBER2024
+    commit 0ef753e81d98bf209f71b03cd331dfc190b5b54d (2025-08-22)
+    src/thrember/features.py        sha256 aa9b29e2267a037ebec0b234234edfc2f8d2316e579ab1a0fba6878e70288eca
+    src/thrember/pefile_warnings.txt sha256 d27a9769f734f302354e1424c38133c143cbe1dfa1a1c8d48030d19bf58fe7cc
+Licensed under the Apache License, Version 2.0 (the full text is in TacoGuard's LICENSE file).
+
+EMBER2024 is by Robert J. Joyce, Gideon Miller, Phil Roth, Richard Zak, Elliott Zaresky-Williams,
+Hyrum Anderson, Edward Raff and James Holt ("EMBER2024 - A Benchmark Dataset for Holistic
+Evaluation of Malware Classifiers", KDD 2025). It builds on EMBER (Endgame, Inc., 2018).
+
+Changes made by TacoGuard are listed at the top of features.py. _hashing.py is TacoGuard's own
+re-implementation of the scikit-learn FeatureHasher steps that thrember uses (scikit-learn is
+BSD-3-Clause; MurmurHash3 is public domain, by Austin Appleby).
+
+pefile_warnings.txt is unchanged.

@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="tacoguard-token" content="__TACOGUARD_TOKEN__">
+<title>TacoGuard</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><img src="icon.svg" alt="" width="22" height="22"><span>TacoGuard</span></div>
+  <nav class="tabs" aria-label="Sections">
+    <a href="#home" data-view="home">Home</a>
+    <a href="#scan" data-view="scan">Scan</a>
+    <a href="#detections" data-view="detections">Detections <span class="badge" id="badge-detections" hidden></span></a>
+    <a href="#quarantine" data-view="quarantine">Quarantine</a>
+    <a href="#trusted" data-view="trusted">Trusted list</a>
+    <a href="#settings" data-view="settings">Settings</a>
+  </nav>
+</header>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<div id="offline" class="banner bad" hidden>TacoGuard's page lost contact with the program. Is the TacoGuard window still open?</div>
+
+<main>
+  <!-- HOME -->
+  <section id="view-home" class="view" hidden>
+    <h1>Home</h1>
+    <div id="notes"></div>
+    <div class="cards">
+      <article class="card" id="card-protection">
+        <h2>Protection</h2>
+        <p class="lead" id="protection-line">Loading...</p>
+        <p class="muted" id="protection-detail"></p>
+        <div class="actions"><a class="btn" href="#scan">Scan something</a>
+          <a class="btn quiet" href="#detections" id="protection-link" hidden>See detections</a></div>
+      </article>
+      <article class="card" id="card-defender">
+        <h2>Microsoft Defender</h2>
+        <p class="lead"><span class="dot" id="defender-dot"></span><span id="defender-line">Checking...</span></p>
+        <p class="muted" id="defender-advice"></p>
+        <p class="muted small" id="defender-detail"></p>
+      </article>
+      <article class="card wide" id="card-signatures">
+        <h2>Signatures and rules</h2>
+        <ul class="sig-list" id="sig-list"></ul>
+        <div class="actions">
+          <button type="button" class="btn" id="btn-setup">Get / refresh signatures</button>
+          <span class="muted small">Downloads from the addresses listed under Settings. Nothing about you or your files is sent.</span>
+        </div>
+        <div id="setup-box" hidden>
+          <p class="small" id="setup-state"></p>
+          <ol class="log" id="setup-log"></ol>
+          <ul class="setup-result" id="setup-result"></ul>
+        </div>
+      </article>
+      <article class="card wide" id="card-updates">
+        <h2>Updates</h2>
+        <p class="banner warn" id="updates-stale" hidden></p>
+        <div class="banner warn" id="updates-rejected" hidden></div>
+        <div class="offer" id="app-offer" hidden></div>
+        <ul class="sig-list" id="updates-list"></ul>
+        <p class="muted small" id="updates-times"></p>
+        <div class="actions">
+          <button type="button" class="btn quiet" id="btn-check-updates">Check for updates</button>
+          <span class="muted small" id="updates-check-state"></span>
+        </div>
+      </article>
+      <article class="card" id="card-lastscan">
+        <h2>Last scan</h2>
+        <div id="lastscan-body"><p class="muted">No scans yet.</p></div>
+      </article>
+      <article class="card" id="card-quarantine">
+        <h2>Quarantine</h2>
+        <p class="lead" id="quarantine-line">-</p>
+        <p class="muted small" id="quarantine-note"></p>
+        <div class="actions"><a class="btn quiet" href="#quarantine">Open quarantine</a></div>
+      </article>
+    </div>
+    <p class="muted small footer-note">Data folder: <span id="data-dir"></span></p>
+  </section>
+
+  <!-- SCAN -->
+  <section id="view-scan" class="view" hidden>
+    <h1>Scan</h1>
+    <div id="scan-current"></div>
+
+    <div class="panel" id="scan-picker">
+      <h2>What to scan</h2>
+      <div class="quick" id="quick-picks" aria-label="Quick picks"></div>
+
+      <form id="typed-form" class="row" autocomplete="off">
+        <label for="typed-path" class="sr-only">Type a file or folder path</label>
+        <input id="typed-path" type="text" placeholder="Or type a path, for example D:\Games\Mods" spellcheck="false">
+        <button type="submit" class="btn quiet">Add</button>
+      </form>
+
+      <details id="browser" class="browser">
+        <summary>Browse folders</summary>
+        <div class="crumbs" id="browse-crumbs"></div>
+        <p class="error small" id="browse-error" hidden></p>
+        <ul class="folders" id="browse-list"></ul>
+        <div class="actions"><button type="button" class="btn quiet" id="browse-add" disabled>Add this folder</button></div>
+      </details>
+
+      <h3>Selected</h3>
+      <ul class="chips" id="targets"><li class="muted">Nothing picked yet.</li></ul>
+      <div class="actions">
+        <button type="button" class="btn primary" id="btn-start" disabled>Start scan</button>
+        <span class="muted small">Scans run at low priority so your PC stays responsive. Nothing is moved or deleted unless you click.</span>
+      </div>
+    </div>
+
+    <div class="panel" id="scan-history-panel">
+      <h2>Recent scans</h2>
+      <ul class="history" id="scan-history"><li class="muted">No scans yet.</li></ul>
+    </div>
+  </section>
+
+  <!-- DETECTIONS -->
+  <section id="view-detections" class="view" hidden>
+    <h1>Detections</h1>
+    <p class="muted">Files that matched a signature or rule in any scan. TacoGuard never quarantines on its own: you decide.</p>
+    <h2>Waiting for your decision</h2>
+    <div id="det-open"><p class="muted">Nothing waiting.</p></div>
+    <details class="handled">
+      <summary>Already handled (<span id="det-handled-count">0</span>)</summary>
+      <div id="det-handled"></div>
+    </details>
+  </section>
+
+  <!-- QUARANTINE -->
+  <section id="view-quarantine" class="view" hidden>
+    <h1>Quarantine</h1>
+    <p class="muted">Files here are stored encrypted, so they can't run or be opened. Restore one only if you're sure it's safe.</p>
+    <p class="small" id="q-summary"></p>
+    <div id="q-list"></div>
+  </section>
+
+  <!-- TRUSTED -->
+  <section id="view-trusted" class="view" hidden>
+    <h1>Trusted list</h1>
+    <p class="muted">TacoGuard skips files on this list. A trusted file is recognised by its fingerprint (a SHA-256 hash), so a changed file is checked again. A trusted folder is not checked at all.</p>
+    <div class="panel">
+      <h2>Add</h2>
+      <form id="trust-folder-form" class="row" autocomplete="off">
+        <label for="trust-folder" class="sr-only">Folder to trust</label>
+        <input id="trust-folder" type="text" placeholder="Folder, for example D:\Games\MyModTools" spellcheck="false">
+        <button type="submit" class="btn quiet">Trust folder</button>
+      </form>
+      <form id="trust-hash-form" class="row" autocomplete="off">
+        <label for="trust-hash" class="sr-only">SHA-256 hash to trust</label>
+        <input id="trust-hash" type="text" placeholder="SHA-256 hash (64 letters and digits)" spellcheck="false">
+        <button type="submit" class="btn quiet">Trust hash</button>
+      </form>
+    </div>
+    <div id="trusted-list"></div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section id="view-settings" class="view" hidden>
+    <h1>Settings</h1>
+    <div class="panel">
+      <h2>Scan limits</h2>
+      <form id="limits-form" class="limits" autocomplete="off">
+        <label><span>Skip files bigger than <span class="unit">(MB)</span></span>
+          <input type="number" name="max_file_size" min="1" step="1" data-scale="1048576"></label>
+        <label><span>Archives inside archives, levels deep</span>
+          <input type="number" name="archive_max_depth" min="0" max="10" step="1"></label>
+        <label><span>Most data unpacked per archive <span class="unit">(MB)</span></span>
+          <input type="number" name="archive_max_total" min="1" step="1" data-scale="1048576"></label>
+        <label><span>Most files per archive</span>
+          <input type="number" name="archive_max_entries" min="1" step="1"></label>
+        <label><span>Most a file inside may grow when unpacked (times its packed size)</span>
+          <input type="number" name="archive_max_ratio" min="2" step="1"></label>
+        <label><span>Largest single file unpacked from an archive <span class="unit">(MB)</span></span>
+          <input type="number" name="archive_member_max" min="1" step="1" data-scale="1048576"></label>
+        <label><span>Disk read speed limit <span class="unit">(MB per second, 0 = no limit)</span></span>
+          <input type="number" name="read_rate_mb_s" min="0" step="any"></label>
+        <label><span>Scan priority</span>
+          <select name="scan_priority">
+            <option value="idle">Lowest (only when the PC is idle)</option>
+            <option value="below_normal">Below normal (faster)</option>
+          </select></label>
+        <label><span>Files ClamAV checks at once <span class="unit">(1 to 8; more is faster but uses more CPU and memory)</span></span>
+          <input type="number" name="clamav_threads" min="1" max="8" step="1"></label>
+        <label class="check wide"><input type="checkbox" name="trust_signed_programs">
+          <span>Trust programs with a valid digital signature
+            <span class="unit block">When a program is signed by its maker (checked by Windows, without going online), a weak match on it is set aside with a note, and a strong match is shown as suspicious instead of malware. Criminals sometimes sign malware with stolen certificates, so strong matches are never hidden.</span></span></label>
+        <div class="actions"><button type="submit" class="btn">Save settings</button>
+          <span class="small" id="limits-msg"></span></div>
+      </form>
+    </div>
+    <div class="panel">
+      <h2>Updates, machine learning and learning</h2>
+      <form id="phase2-form" class="limits" autocomplete="off">
+        <label class="check wide"><input type="checkbox" name="auto_update">
+          <span>Check for updates automatically
+            <span class="unit block">When TacoGuard starts, then every few hours while it runs. Every update is checked before it's used (a digital signature or a published checksum); a bad one is refused and the last good set stays.</span></span></label>
+        <label><span>Hours between update checks <span class="unit">(1 to 24)</span></span>
+          <input type="number" name="update_interval_h" min="1" max="24" step="1"></label>
+        <label class="check wide"><input type="checkbox" name="ml_enabled">
+          <span>Machine-learning check for Windows programs
+            <span class="unit block">A model on this PC gives each program a score. On its own it never calls a file malware, only suspicious.</span></span></label>
+        <label><span>Largest program the ML check scores <span class="unit">(MB)</span></span>
+          <input type="number" name="ml_max_file_size" min="1" max="1024" step="1" data-scale="1048576"></label>
+        <label class="check wide"><input type="checkbox" name="learning_enabled">
+          <span>Learn from my choices
+            <span class="unit block">Only from your own "Not a threat" and "It's a threat" clicks, kept on this PC. Files you confirm as threats go on your own known-bad list. A rule you marked safe on 3 different files counts for less.</span></span></label>
+        <div class="actions"><button type="submit" class="btn">Save</button>
+          <span class="small" id="phase2-msg"></span></div>
+      </form>
+      <div id="signers"></div>
+    </div>
+    <div class="panel">
+      <h2>What TacoGuard has learned from you</h2>
+      <p class="muted" id="learned-intro"></p>
+      <ul class="trusted" id="learned-list"></ul>
+    </div>
+    <div class="panel">
+      <h2>Internet addresses TacoGuard uses</h2>
+      <p class="muted">This is the complete list. TacoGuard never uploads your files or anything about you.</p>
+      <div id="endpoints"></div>
+    </div>
+    <div class="panel">
+      <h2>Licenses and credits</h2>
+      <div id="licenses"></div>
+    </div>
+    <div class="panel">
+      <h2>Where things are kept</h2>
+      <dl class="kv" id="paths"></dl>
+    </div>
+    <div class="panel">
+      <h2>Stop TacoGuard's page</h2>
+      <p class="muted">Closes this page's local server, the same as pressing Ctrl+C in the TacoGuard window. Start TacoGuard again to come back.</p>
+      <button type="button" class="btn quiet" id="btn-quit">Stop the page</button>
+    </div>
+  </section>
+</main>
+
+<dialog id="dialog">
+  <form method="dialog" class="dialog-body">
+    <h2 id="dialog-title"></h2>
+    <div id="dialog-text"></div>
+    <label class="check" id="dialog-check-row" hidden><input type="checkbox" id="dialog-check"> <span id="dialog-check-label"></span></label>
+    <div class="actions end">
+      <button value="cancel" class="btn quiet" id="dialog-cancel">Cancel</button>
+      <button value="ok" class="btn primary" id="dialog-ok">OK</button>
+    </div>
+  </form>
+</dialog>
+</body>
+</html>

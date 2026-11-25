@@ -1,0 +1,22 @@
+{
+  "about": "Which YARA Forge rule sources TacoGuard may use. A source is kept only when its license text matches an 'allow' entry and no 'deny' entry. Sources without a license file are left out. Single rules are also left out when their own license meta or source URL matches a 'deny' entry. Checked in order; the first allow match names the license.",
+  "no_license_markers": ["NO LICENSE SET"],
+  "deny": [
+    {"pattern": "\\bnon[- ]?commercial\\b", "why": "non-commercial use only"},
+    {"pattern": "\\bCC[- ]?BY[- ]?(SA[- ]?)?NC\\b|\\bBY-NC\\b", "why": "Creative Commons non-commercial"},
+    {"pattern": "Elastic License", "why": "Elastic License"},
+    {"pattern": "Commons Clause", "why": "Commons Clause (no selling)"}
+  ],
+  "deny_source_urls": ["github.com/elastic/"],
+  "allow": [
+    {"short": "DRL 1.1", "pattern": "Detection Rule License"},
+    {"short": "Apache-2.0", "pattern": "Apache License"},
+    {"short": "MIT", "pattern": "\\bMIT License\\b|^\\s*MIT\\s*$"},
+    {"short": "BSD-2-Clause", "pattern": "2-Clause BSD|BSD 2-Clause"},
+    {"short": "BSD-3-Clause", "pattern": "3-Clause BSD|BSD 3-Clause"},
+    {"short": "BSD", "pattern": "Redistribution and use in source and binary forms"},
+    {"short": "GPL-3.0", "pattern": "GNU GENERAL PUBLIC LICENSE\\s+Version 3|General Public License version 3"},
+    {"short": "GPL-2.0", "pattern": "GNU GENERAL PUBLIC LICENSE\\s+Version 2"},
+    {"short": "CC BY 4.0", "pattern": "\\bCC[- ]BY[- ]4\\.0\\b|Creative Commons Attribution 4\\.0"}
+  ]
+}

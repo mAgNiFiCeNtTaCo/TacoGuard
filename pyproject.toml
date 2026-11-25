@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tacoguard"
+version = "0.2.0"
+description = "A second-opinion malware scanner for Windows that works next to Microsoft Defender."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "yara-x>=1.24",
+    "cryptography>=46",
+    "py7zr>=1.0",
+    "rarfile>=4.2",
+    "psutil>=7.0",
+    # machine-learning score (tacoguard/ml, detect/ml.py): EMBER2024 feature version 3
+    "numpy>=2.0",
+    "scipy>=1.13",              # used directly by tacoguard/ml/_hashing.py; LightGBM needs it too
+    "lightgbm>=4.6,<5",
+    "pefile==2024.8.26",        # feature values depend on pefile's parsing: keep it pinned
+    "signify==0.7.1",           # 0.8+ breaks the Authenticode features (EMBER2024 issues #4/#13/#14)
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["tacoguard*"]
+
+[tool.setuptools.package-data]
+tacoguard = ["web/static/*", "data/*", "ml/pefile_warnings.txt", "ml/NOTICE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "clamav: needs the real ClamAV program (skipped when it is not set up)",
+    "slow: takes more than a few seconds",
+]

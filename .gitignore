@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+# runtime data never lives in the project, but just in case a test points here
+TacoGuard-data/
+*.tgq
+*.dpapi
+tacoguard.db*
+# reports from the false-positive run can list your installed programs
+reports/fp-*.json
+
+# built release folders (published to GitHub, not kept in git)
+releases/
