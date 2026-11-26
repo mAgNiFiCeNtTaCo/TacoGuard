@@ -1,7 +1,13 @@
 """TacoGuard launcher (copied into the install folder by `python -m tacoguard install`).
 
     venv\\Scripts\\pythonw.exe TacoGuard.pyw [args]     no window: starts the page (args default: serve)
+    venv\\Scripts\\pythonw.exe TacoGuard.pyw --background
+                                                      the same without opening the browser (the
+                                                      start-at-sign-in entry, tacoguard/autostart.py)
     TacoGuard.cmd [args]                              console: runs the command and shows its output
+
+A start while TacoGuard already runs opens the running one's page (`serve` sees the port in use),
+except with --background, which then does nothing.
 
 Reads current.json, puts versions\\<version> first on PYTHONPATH and runs `-m tacoguard <args>`
 from that folder with the installed Python. Without a console the output goes to the data
@@ -153,8 +159,22 @@ def finish_pending(cur, now=None):
     return back
 
 
+def build_args(argv):
+    """The tacoguard command line for the launcher's own arguments: none -> serve;
+    --background -> serve --no-browser (other options such as --data are kept)."""
+    args = list(argv)
+    if "--background" not in args:
+        return args or ["serve"]
+    args = [a for a in args if a != "--background"]
+    if "serve" not in args:
+        args.append("serve")
+    if "--no-browser" not in args:
+        args.insert(args.index("serve") + 1, "--no-browser")
+    return args
+
+
 def main():
-    args = sys.argv[1:] or ["serve"]
+    args = build_args(sys.argv[1:])
     cur = read_json(os.path.join(ROOT, "current.json"))
     if cur is None or not valid(cur.get("version")):
         raise SystemExit("current.json names no valid version; run the TacoGuard installer again.")

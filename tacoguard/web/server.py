@@ -17,12 +17,18 @@ Errors go to the page as {"error": plain English}; details go to <data>\\logs\\w
 Phase 2: the Updates card (updates/updater.py), the app-update offer (selfupdate.py: installed only
 from the user's click on "Install update") and learning (learning.py). A Phase 2 module that is
 missing gives a calm "not available yet" on the page, never an error.
+
+Phase 3: the page process starts and watches the guard process (GuardSupervisor, only when serve()
+asks: never in tests unless a test sets it up on purpose with a fake command), and the Protection
+tab: /api/protection plus the user's actions on guard events, paused programs and start-up
+entries (the guard never acts on files itself; the page does what the user clicked).
 """
 from __future__ import annotations
 
 import ctypes
 import hmac
 import http.client
+import importlib.util
 import inspect
 import io
 import json
@@ -33,6 +39,8 @@ import os
 import re
 import secrets
 import socket
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -43,9 +51,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .. import APP_NAME, __version__, allowlist, defender, detect, learning, quarantine, setup_fetch, winpath
-from ..config import CLAMAV_THREADS_MAX, ENDPOINTS, clamav_thread_count, load_settings
-from ..model import MALWARE, SUSPICIOUS, Finding, plain_error
+from .. import APP_NAME, __version__, allowlist, autostart, defender, detect, learning, quarantine, setup_fetch, winpath
+from ..config import CLAMAV_THREADS_MAX, ENDPOINTS, clamav_thread_count, install_root, load_settings
+from ..guard import procctl
+from ..model import ENGINE_NAMES, MALWARE, SUSPICIOUS, Confidence, Finding, plain_error
 from ..scan import jobs
 from ..store import JOB_ACTIVE, Store
 
@@ -137,6 +146,386 @@ def _load_signed():
     return signed
 
 
+# ---- Phase 3: real-time protection (contract: tacoguard/guard/__init__.py) ----------------------
+PHASE3_SWITCHES = {
+    "realtime_enabled": "'Real-time protection'",
+    "start_at_sign_in": "'Start TacoGuard when I sign in'",
+    "watch_processes": "'Check newly started programs'",
+    "pause_malware_processes": "'Pause a program found to be malware'",
+    "ransomware_guard": "'Ransomware guard'",
+    "ransomware_pause": "'Pause programs that change a decoy file'",
+    "persistence_watch": "'Report new start-up entries'",
+    "realtime_clamav_second_opinion": "'Ask ClamAV for a second opinion'",
+}
+PHASE3_FOLDER_LISTS = {"watch_folders": "Watched folders", "canary_folders": "Decoy folders"}
+PHASE3_MAX_FOLDERS = 50
+REALTIME_MAX_FILE = (1024**2, 4 * 1024**3,
+                     "The largest new file real-time protection checks must be from 1 to 4096 MB.")
+CREATE_NO_WINDOW = 0x08000000
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+GUARD_BACKOFF_S = (5, 30, 120)       # wait before restarting after the 1st, 2nd, 3rd+ crash
+GUARD_EXIT_RECYCLE = 75              # guard/service.py EXIT_RECYCLE: restart at once, not a crash
+GUARD_MAX_CRASHES = 5                # ... this many crashes within GUARD_CRASH_WINDOW_S: give up
+GUARD_CRASH_WINDOW_S = 600
+GUARD_STOP_WAIT_S = 5.0
+GUARD_FRESH_S = 35                   # the guard writes its heartbeat every 10 s
+GUARD_HUNG_S = 90                    # our guard runs but wrote no heartbeat for this long: it hangs
+GUARD_POLL_S = 2.0                   # how often the page looks whether its guard still runs
+PROTECTION_EVENTS = 100
+GUARD_NOT_READY = "Real-time protection isn't part of this copy of TacoGuard yet."
+PERSISTENCE_NOT_READY = "Start-up entry actions aren't available in this copy of TacoGuard yet."
+PART_LABELS = (("folders", "New and changed files"), ("processes", "Newly started programs"),
+               ("ransomware", "Ransomware decoys"), ("persistence", "Start-up entries"))
+CFA_ON_NOTE = ("Controlled folder access is on, so Windows may block TacoGuard from making its decoy files "
+               "in protected folders such as Documents and Pictures. If Windows Security says it blocked "
+               "pythonw.exe or python.exe, you can allow it there (Ransomware protection > Allow an app "
+               "through Controlled folder access). TacoGuard never changes this setting itself.")
+
+
+def _load_persistence():
+    from ..guard import persistence
+    return persistence
+
+
+def _load_guard_folders():
+    from ..guard import folders
+    return folders
+
+
+def guard_command(settings, parent_pid: int) -> list[str] | None:
+    """`python -m tacoguard.guard --data DIR --parent PID`, or None when this copy has no guard."""
+    try:
+        if importlib.util.find_spec("tacoguard.guard.__main__") is None:
+            return None
+    except (ImportError, ValueError):
+        return None
+    return [sys.executable, "-m", "tacoguard.guard", "--data", str(settings.data_dir),
+            "--parent", str(int(parent_pid))]
+
+
+def read_guard_state(store) -> dict:
+    """meta "guard_state" (the guard's heartbeat), {} when missing or damaged."""
+    try:
+        if hasattr(store, "get_meta"):
+            raw = store.get_meta("guard_state")
+        else:
+            row = store._one("SELECT value FROM meta WHERE key='guard_state'")
+            raw = row["value"] if row else None
+        data = json.loads(raw) if raw else {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _pid_exists(pid) -> bool:
+    try:
+        import psutil
+        return int(pid) > 0 and psutil.pid_exists(int(pid))
+    except Exception:
+        return False
+
+
+def _guard_process(pid):
+    """The running guard process with this pid (its command line names tacoguard.guard), or None."""
+    try:
+        import psutil
+        p = psutil.Process(int(pid))
+        if "tacoguard.guard" in " ".join(p.cmdline()).lower():
+            return p
+    except Exception:
+        pass
+    return None
+
+
+def _kill_tree(proc) -> None:
+    """End a guard process WE started and everything it started (the venv's python.exe is a
+    launcher: the real guard is its child)."""
+    try:
+        import psutil
+        kids = psutil.Process(proc.pid).children(recursive=True)
+    except Exception:
+        kids = []
+    for k in kids:
+        try:
+            k.kill()
+        except Exception:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _wait_words(seconds: float) -> str:
+    s = int(round(seconds))
+    return f"{s} seconds" if s < 60 else (f"{s // 60} minute" + ("s" if s >= 120 else ""))
+
+
+class GuardSupervisor:
+    """Starts the guard process, restarts it after a crash (5 s, 30 s, 2 min), gives up after 5
+    crashes in 10 minutes (with a plain note), adopts a guard that already runs (fresh heartbeat
+    and pid alive with tacoguard.guard in its command line) and stops it cleanly: the "stop"
+    file in settings.guard_dir, up to 5 s, then it is ended. One small thread that wakes every
+    GUARD_POLL_S seconds (or at once when settings change)."""
+
+    def __init__(self, app: "App"):
+        self.app = app
+        self.settings = app.settings
+        self.command = guard_command          # (settings, parent_pid) -> list | None (tests: a fake)
+        self.backoff = GUARD_BACKOFF_S
+        self.max_crashes, self.window = GUARD_MAX_CRASHES, GUARD_CRASH_WINDOW_S
+        self.stop_wait, self.poll_s, self.fresh_s = GUARD_STOP_WAIT_S, GUARD_POLL_S, GUARD_FRESH_S
+        self.hung_s = GUARD_HUNG_S
+        self.proc: subprocess.Popen | None = None
+        self.proc_started = 0.0
+        self.adopted = None                   # psutil.Process of a guard we found running
+        self.crashes: list[float] = []
+        self.gave_up = False
+        self.unavailable = False
+        self.next_start = 0.0
+        self.starts = 0
+        self.message = ""
+        self._lock = threading.RLock()
+        self._wake = threading.Event()
+        self._closing = False
+        self._thread: threading.Thread | None = None
+
+    # ---- control ------------------------------------------------------------------------
+    def start(self) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._loop, name="tacoguard-guard-watch", daemon=True)
+            self._thread.start()
+
+    def wake(self) -> None:
+        self._wake.set()
+
+    def close(self) -> None:
+        self._closing = True
+        self._wake.set()
+        if self._thread is not None:
+            self._thread.join(self.stop_wait + 5)
+        with self._lock:
+            self._stop_guard()
+
+    @property
+    def running(self) -> bool:
+        with self._lock:
+            return self._running()
+
+    def pid(self) -> int | None:
+        with self._lock:
+            if self.proc is not None and self.proc.poll() is None:
+                return self.proc.pid
+            if self.adopted is not None:
+                return self.adopted.pid
+        return None
+
+    # ---- the watch loop ---------------------------------------------------------------------
+    def _loop(self) -> None:
+        while not self._closing:
+            try:
+                self.step()
+            except Exception:
+                self.app.log.error("guard supervision failed\n%s", traceback.format_exc())
+            self._wake.wait(self.poll_s)
+            self._wake.clear()
+
+    def step(self) -> None:
+        """One look: start, restart, adopt or stop the guard as settings.realtime_enabled says."""
+        with self._lock:
+            if self._closing:
+                return
+            if not self.settings.realtime_enabled:
+                if self._running():
+                    self._stop_guard()
+                self.crashes.clear()
+                self.gave_up = self.unavailable = False
+                self.message, self.next_start = "", 0.0
+                return
+            if self.adopted is not None:
+                if self._adopted_alive():
+                    return
+                self.adopted = None           # it ended (its own page went away): start ours
+            if self.proc is not None:
+                rc = self.proc.poll()
+                if rc is None:
+                    if not self._hung():
+                        return
+                    self.app.log.error("the guard wrote no heartbeat for over %s s; ending it", self.hung_s)
+                    _kill_tree(self.proc)
+                    rc = "hung"
+                self.proc = None
+                if rc == GUARD_EXIT_RECYCLE:      # it gave its memory back: start a fresh one now
+                    self.app.log.info("the guard restarted itself to give back memory")
+                    self.next_start = 0.0
+                else:
+                    self._crashed(rc)
+            if self.gave_up or self.unavailable or time.time() < self.next_start:
+                return
+            found = self._find_running_guard()
+            if found is not None:
+                self.adopted = found
+                self.app.log.info("adopted the guard that was already running (pid %s)", found.pid)
+                return
+            self._launch()
+
+    def _hung(self) -> bool:
+        """Our own guard runs, started over hung_s ago, but its last heartbeat is older than
+        hung_s: something inside it stopped (the control loop writes it every 10 s)."""
+        now = time.time()
+        if not self.proc_started or now - self.proc_started < self.hung_s:
+            return False
+        try:
+            hb = float(read_guard_state(self.app.store).get("heartbeat") or 0)
+        except (TypeError, ValueError):
+            hb = 0.0
+        return now - max(hb, self.proc_started) > self.hung_s
+
+    def _running(self) -> bool:
+        return (self.proc is not None and self.proc.poll() is None) or \
+            (self.adopted is not None and self._adopted_alive())
+
+    def _adopted_alive(self) -> bool:
+        try:
+            return self.adopted.is_running() and self.adopted.status() != "zombie"
+        except Exception:
+            return False
+
+    def _find_running_guard(self):
+        st = read_guard_state(self.app.store)
+        try:
+            fresh = time.time() - float(st.get("heartbeat") or 0) < self.fresh_s
+        except (TypeError, ValueError):
+            fresh = False
+        if not fresh or not st.get("pid"):
+            return None
+        return _guard_process(st["pid"])
+
+    def _crashed(self, rc) -> None:
+        now = time.time()
+        self.crashes = [t for t in self.crashes if now - t < self.window] + [now]
+        n = len(self.crashes)
+        self.app.log.error("the guard process stopped unexpectedly (exit code %s, %d in %d s)", rc, n,
+                           self.window)
+        if n >= self.max_crashes:
+            self.gave_up = True
+            self.message = (f"Real-time protection stopped unexpectedly {n} times in {self.window // 60} "
+                            "minutes, so TacoGuard stopped restarting it. Details are in "
+                            f"{self.settings.log_dir}. Switch real-time protection off and on in Settings, "
+                            "or restart TacoGuard, to try again.")
+            return
+        delay = self.backoff[min(n - 1, len(self.backoff) - 1)]
+        self.next_start = now + delay
+        self.message = (f"Real-time protection stopped unexpectedly. TacoGuard starts it again in "
+                        f"{_wait_words(delay)}.")
+
+    def _console_log(self):
+        try:
+            self.settings.log_dir.mkdir(parents=True, exist_ok=True)
+            path = self.settings.log_dir / "guard-console.log"
+            if path.is_file() and path.stat().st_size > 1024**2:
+                os.replace(path, path.with_name(path.name + ".1"))
+            return open(path, "ab")
+        except OSError:
+            return None
+
+    def _launch(self) -> None:
+        cmd = self.command(self.settings, os.getpid())
+        if not cmd:
+            self.unavailable = True
+            self.message = GUARD_NOT_READY
+            return
+        stop = self.settings.guard_dir / "stop"
+        try:
+            stop.unlink(missing_ok=True)      # a stop request left over from last time
+        except OSError:
+            pass
+        out = self._console_log()
+        try:
+            self.proc = subprocess.Popen(
+                cmd, cwd=str(PROJECT_ROOT), stdin=subprocess.DEVNULL,
+                stdout=out if out is not None else subprocess.DEVNULL, stderr=subprocess.STDOUT,
+                close_fds=True, creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
+            self.starts += 1
+            self.proc_started = time.time()
+            self.app.log.info("started the guard (pid %s)", self.proc.pid)
+        except OSError:
+            self.app.log.error("could not start the guard\n%s", traceback.format_exc())
+            self.proc = None
+            self._crashed("not started")
+        finally:
+            if out is not None:
+                out.close()
+
+    def _stop_guard(self) -> None:
+        """Ask the guard to stop (the stop file), wait up to stop_wait, then end it."""
+        proc, adopted = self.proc, self.adopted
+        self.proc = self.adopted = None
+        if proc is None and adopted is None:
+            return
+        stop = self.settings.guard_dir / "stop"
+        try:
+            stop.parent.mkdir(parents=True, exist_ok=True)
+            stop.write_text("stop\n", encoding="utf-8")
+        except OSError:
+            pass
+        try:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.wait(self.stop_wait)
+                except subprocess.TimeoutExpired:
+                    self.app.log.info("the guard did not stop within %s s; ending it", self.stop_wait)
+                    _kill_tree(proc)
+            if adopted is not None:
+                try:
+                    adopted.wait(self.stop_wait)
+                except Exception:
+                    try:
+                        adopted.kill()
+                    except Exception:
+                        pass
+        finally:
+            try:
+                stop.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _event_for_page(e: dict) -> dict:
+    return _result_for_page(e)        # adds "short", "ml_score", "signature_match"
+
+
+def _findings_reason(findings: list[dict]) -> str:
+    """"Matched YARA rule 'X' (source, high confidence) and the ML score was 0.97"."""
+    sig = [f for f in findings or [] if f.get("engine") != "ml"]
+    score = None
+    for f in findings or []:
+        if f.get("engine") == "ml":
+            m = _ML_SCORE_RE.search(str(f.get("detail") or ""))
+            if m:
+                score = m.group(1)
+    parts = ""
+    if sig:
+        top = max(sig, key=lambda f: int(f.get("confidence") or 1))
+        try:
+            word = Confidence(int(top.get("confidence") or 1)).word
+        except ValueError:
+            word = "low"
+        parts = (f"Matched {ENGINE_NAMES.get(top.get('engine'), top.get('engine'))} '{top.get('rule')}' "
+                 f"({top.get('source') or 'unknown source'}, {word} confidence)")
+        if len(sig) > 1:
+            parts += f" and {len(sig) - 1} more"
+        if score:
+            parts += f" and the ML score was {score}"
+    elif score:
+        parts = f"ML score {score}, no signature match"
+    return parts
+
+
 class ApiError(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
@@ -176,6 +565,25 @@ KNOWN_FOLDERS = [
     ("Desktop", "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}"),
     ("Documents", "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}"),
 ]
+# The default decoy folders (Phase 3; the user's choice 2026-11-24). Never inside OneDrive.
+CANARY_KNOWN_FOLDERS = [
+    ("Documents", "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}"),
+    ("Desktop", "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}"),
+    ("Pictures", "{33E28130-4E1E-4676-835A-98395C3BC3BB}"),
+    ("Downloads", "{374DE290-123F-4565-9164-39C4925E467B}"),
+]
+
+
+def _in_onedrive(path: str) -> bool:
+    for var in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+        root = os.environ.get(var)
+        if root:
+            try:
+                if winpath.is_under(path, winpath.norm_key(root)):
+                    return True
+            except (OSError, ValueError):
+                pass
+    return False
 
 
 def quick_picks() -> list[dict]:
@@ -526,6 +934,10 @@ class App:
         self._offer: tuple[float, dict | None] = (0.0, None)
         self.log = self._make_logger()
         self.static = self._load_static()
+        # Phase 3: the guard process (started only by serve(); tests set a fake command first)
+        self.manage_guard = False
+        self.guard = GuardSupervisor(self)
+        self.autostart_key: str | None = None   # tests: a key under HKCU\Software\TacoGuardTest
 
     def _make_logger(self) -> logging.Logger:
         log = logging.getLogger(f"tacoguard.web.{id(self)}")
@@ -542,6 +954,10 @@ class App:
         return log
 
     def close(self) -> None:
+        try:
+            self.guard.close()
+        except Exception:
+            self.log.error("stopping the guard failed\n%s", traceback.format_exc())
         self.stop_updates()
         for h in list(self.log.handlers):
             h.close()
@@ -893,6 +1309,247 @@ class App:
     def quarantine(self):
         return quarantine.Quarantine(self.settings, self.store)
 
+    # ---- real-time protection (Phase 3) ------------------------------------------------------
+    def start_guard(self) -> None:
+        """serve() only: from now on the page starts and watches the guard process."""
+        self.manage_guard = True
+        self.guard.start()
+
+    def apply_guard(self) -> None:
+        """settings.realtime_enabled changed: start or stop the guard now (when we manage it)."""
+        if self.manage_guard:
+            self.guard.wake()
+
+    def _guard_alive(self) -> bool:
+        """A guard process runs for this data folder (ours, or one we found by its heartbeat)."""
+        if self.guard.running:
+            return True
+        st = read_guard_state(self.store)
+        return bool(st.get("pid")) and _guard_process(st["pid"]) is not None
+
+    def remove_decoys_after_guard(self, wait_s: float = 20.0) -> None:
+        """The ransomware guard was switched off: take TacoGuard's decoy files away. While a guard
+        runs with real-time protection on, it does that itself when it sees the new settings.
+        Otherwise they are removed once no guard runs any more (a guard still stopping would
+        otherwise put a deleted decoy back)."""
+        try:
+            from ..guard import ransom
+        except ImportError:
+            return
+        if self.settings.realtime_enabled and self._guard_alive():
+            return                      # the running guard removes them itself
+
+        def run():
+            end = time.monotonic() + wait_s
+            while self._guard_alive() and time.monotonic() < end:
+                time.sleep(0.25)
+            if self.settings.ransomware_guard or (self.settings.realtime_enabled and self._guard_alive()):
+                return                  # switched on again meanwhile, or a guard took over
+            try:
+                n = ransom.remove_decoys(self.settings)
+                if n:
+                    self.log.info("removed %s decoy files (the ransomware guard is off)", n)
+            except Exception:
+                self.log.error("could not remove the decoy files\n%s", traceback.format_exc())
+
+        if not self._guard_alive():
+            run()
+            return
+        self._decoy_thread = threading.Thread(target=run, name="tacoguard-decoys-off", daemon=True)
+        self._decoy_thread.start()
+
+    def guard_view(self) -> dict:
+        s, sup = self.settings, self.guard
+        st = read_guard_state(self.store)
+        try:
+            hb = float(st.get("heartbeat") or 0)
+        except (TypeError, ValueError):
+            hb = 0.0
+        alive = bool(st.get("pid")) and time.time() - hb < GUARD_FRESH_S and _pid_exists(st.get("pid"))
+        raw_parts = st.get("parts") if isinstance(st.get("parts"), dict) else {}
+        parts = []
+        if alive:
+            for name, label in PART_LABELS:
+                p = raw_parts.get(name) if isinstance(raw_parts.get(name), dict) else {}
+                watched = [w for w in (p.get("watched") or []) if isinstance(w, str)][:200]
+                try:
+                    checked = int(p.get("checked") or 0)
+                except (TypeError, ValueError):
+                    checked = 0
+                parts.append({"name": name, "label": label, "state": str(p.get("state") or "starting"),
+                              "message": str(p.get("message") or ""), "watched": watched,
+                              "short_watched": [_short(w) for w in watched], "checked": checked})
+        note = sup.message
+        if not s.realtime_enabled:
+            state, summary, note = "off", ("Real-time protection is off (you can turn it on in Settings). "
+                                           "TacoGuard still checks files when you scan them."), ""
+        elif sup.gave_up:
+            state, summary, note = "error", sup.message, ""
+        elif alive:
+            on = {p["name"]: p for p in parts if p["state"] == "on"}
+            bits = []
+            if "folders" in on:
+                n = len(on["folders"]["watched"])
+                bits.append(f"watching {n} folder{'s' if n != 1 else ''}" if n else "watching your folders")
+            if "processes" in on:
+                bits.append("new programs")
+            if "ransomware" in on:
+                n = len(on["ransomware"]["watched"])
+                bits.append(f"decoys in {n} folder{'s' if n != 1 else ''}" if n else "decoy files")
+            if "persistence" in on:
+                bits.append("start-up entries")
+            summary = ("Real-time protection is on: " + ", ".join(bits) + "." if bits else
+                       "Real-time protection is running, but each of its parts is switched off in Settings.")
+            state = "warn" if any(p["state"] == "error" for p in parts) else "on"
+            if state == "warn":
+                summary += " One part has a problem (see below)."
+            if sup.message and not sup.crashes:
+                note = ""
+        elif sup.unavailable:
+            state, summary, note = "unavailable", GUARD_NOT_READY, ""
+        elif self.manage_guard:
+            state, summary = "starting", "Real-time protection is starting..."
+        else:
+            state, summary = "off", "Real-time protection is not running. It starts together with TacoGuard."
+        return {"enabled": bool(s.realtime_enabled), "alive": alive, "state": state, "summary": summary,
+                "note": note, "parts": parts, "started": st.get("started") or 0,
+                "heartbeat": hb, "version": str(st.get("version") or ""),
+                "managed": self.manage_guard, "gave_up": sup.gave_up}
+
+    def _event_brief(self, event_id, cache: dict) -> dict | None:
+        if not event_id:
+            return None
+        ev = cache.get(event_id) or self.store.get_guard_event(int(event_id))
+        if not ev:
+            return None
+        return {k: ev.get(k) for k in ("id", "title", "message", "level", "kind", "state", "created")}
+
+    def protection_view(self) -> dict:
+        """Everything the Protection tab shows. Programs paused by the guard that have closed in
+        the meantime are marked "gone" here (their event stays, with the file actions)."""
+        events = [_event_for_page(e) for e in self.store.list_guard_events(limit=PROTECTION_EVENTS)]
+        cache = {e["id"]: e for e in events}
+        paused = []
+        for row in self.store.list_paused(("paused",)):
+            ref = procctl.ProcRef(int(row["pid"]), float(row["create_time"]))
+            if not procctl.is_alive(ref):
+                self.store.set_paused_state(row["id"], "gone")
+                continue
+            paused.append(dict(row, alive=True, short=_short(row["exe"]),
+                               event=self._event_brief(row["event_id"], cache)))
+        startup = [dict(r, short_target=_short(r.get("target") or ""),
+                        event=self._event_brief(r.get("event_id"), cache))
+                   for r in self.store.list_persistence(("new",))]
+        undone = [dict(r, short_target=_short(r.get("target") or ""))
+                  for r in self.store.list_persistence(("undone",))]
+        linked = {p["event_id"] for p in paused if p["event_id"]} | \
+                 {r["event_id"] for r in startup if r.get("event_id")}
+        attention = [_event_for_page(e) for e in self.store.list_guard_events(("new",), limit=200)
+                     if e["id"] not in linked]
+        levels = [e["level"] for e in attention] + [(p["event"] or {}).get("level") for p in paused]
+        return {
+            "guard": self.guard_view(), "events": events, "paused": paused, "startup": startup,
+            "startup_undone": undone, "attention": attention,
+            "counts": {"attention": len(paused) + len(startup) + len(attention),
+                       "malware": sum(1 for lv in levels if lv == MALWARE)},
+            "cfa": self.cfa_view(), "autostart": self.autostart_view(),
+        }
+
+    def protection_brief(self) -> dict:
+        """The Home card's line and the tab badge (cheap: counts only)."""
+        try:
+            g = self.guard_view()
+            n_new = len(self.store.list_guard_events(("new",), limit=200))
+            n_paused = len(self.store.list_paused(("paused",)))
+            return {"state": g["state"], "summary": g["summary"], "alive": g["alive"],
+                    "attention": n_new + n_paused}
+        except Exception:
+            self.log.error("protection brief failed\n%s", traceback.format_exc())
+            return {"state": "unknown", "summary": "", "alive": False, "attention": 0}
+
+    def cfa_view(self) -> dict:
+        cfa = (self.defender_status() or {}).get("cfa")
+        if not isinstance(cfa, dict):
+            cfa = {"state": "checking", "value": None, "message": "Checking Windows Security..."}
+        return dict(cfa, note=CFA_ON_NOTE if cfa.get("state") == "on" else "")
+
+    def _installed_copy(self) -> bool:
+        sm = self._optional(_load_selfupdate)
+        try:
+            return bool(sm and sm.running_from_install())
+        except Exception:
+            return False
+
+    def autostart_view(self) -> dict:
+        st = autostart.status(self.autostart_key)
+        installed = self._installed_copy()
+        return dict(st, installed=installed, setting=bool(self.settings.start_at_sign_in),
+                    note="" if installed else autostart.NOT_INSTALLED_MSG)
+
+    def apply_autostart(self) -> str:
+        """settings.start_at_sign_in changed: add or remove the Run entry. Returns a plain sentence."""
+        try:
+            if self.settings.start_at_sign_in:
+                return autostart.enable(install_root(), key_path=self.autostart_key)
+            return autostart.disable(key_path=self.autostart_key, only_for_root=install_root())
+        except autostart.AutostartError as e:
+            return str(e)
+        except Exception:
+            self.log.error("start at sign-in failed\n%s", traceback.format_exc())
+            return "TacoGuard could not change its start-at-sign-in entry. Details are in the log."
+
+    def default_folders(self) -> dict:
+        """What 'use the defaults' means for watched folders and decoy folders (display paths)."""
+        import dataclasses
+        watch: list[str] = []
+        mod = self._optional(_load_guard_folders)
+        fn = getattr(mod, "default_watch_folders", None) if mod else None
+        if callable(fn):
+            try:
+                watch = [str(p) for p in fn(dataclasses.replace(self.settings, watch_folders=[]))]
+            except Exception:
+                self.log.error("default_watch_folders failed\n%s", traceback.format_exc())
+        if not watch:
+            watch = [p["path"] for p in quick_picks() if p["kind"] == "folder"]
+            startup = os.path.join(os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming"),
+                                   "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+            if os.path.isdir(startup):
+                watch.append(startup)
+        canary = []
+        home = os.path.expanduser("~")
+        for name, guid in CANARY_KNOWN_FOLDERS:
+            p = _known_folder(guid) or os.path.join(home, name)
+            if os.path.isdir(p) and not _in_onedrive(p) and p not in canary:
+                canary.append(p)
+        return {"watch_folders": watch, "canary_folders": canary}
+
+    def _folder_list(self, key: str, value) -> list[str]:
+        label = PHASE3_FOLDER_LISTS[key]
+        if not isinstance(value, list) or len(value) > PHASE3_MAX_FOLDERS:
+            raise ApiError(400, f"{label} must be a list of at most {PHASE3_MAX_FOLDERS} folders.")
+        out, seen = [], set()
+        for v in value:
+            if not isinstance(v, str) or not v.strip() or len(v) > 32000:
+                raise ApiError(400, f"{label}: one of the folders is empty or not a folder path.")
+            raw = v.strip().strip('"')
+            disp = winpath.to_display(raw)
+            if re.fullmatch(r"[A-Za-z]:", disp):
+                disp += "\\"
+            disp = winpath.to_display(os.path.abspath(disp))
+            if not os.path.isdir(winpath.to_long(disp)):
+                raise ApiError(400, f"{label}: folder not found: {disp}")
+            nk = winpath.norm_key(disp)
+            if key == "canary_folders":
+                if len(nk) <= 3:
+                    raise ApiError(400, f"Decoy folders: pick folders, not a whole drive ({disp}).")
+                if _in_onedrive(disp):
+                    raise ApiError(400, f"Decoy folders can't be inside OneDrive (TacoGuard never puts decoy "
+                                        f"files there): {disp}")
+            if nk not in seen:
+                seen.add(nk)
+                out.append(disp)
+        return out
+
     # ---- pieces of status ----------------------------------------------------------------
     def signature_status(self) -> dict:
         try:
@@ -945,6 +1602,7 @@ class App:
                 "open_suspicious": sum(1 for d in open_ if d["level"] == SUSPICIOUS),
             },
             "quarantine": self.quarantine_summary(),
+            "protection": self.protection_brief(),
             "setup": {"running": self.setup_state["running"]},
             "busy": bool(active) or self.setup_state["running"],
             "data_dir": str(self.settings.root),
@@ -1001,12 +1659,36 @@ class App:
             "signatures_max_age_days": s.signatures_max_age_days,
             "phase2_limits": {k: {"min": v[1], "max": v[2]} for k, v in PHASE2_NUMBERS.items()},
             "signers": self.trusted_signers(),
+            # Phase 3
+            **{k: bool(getattr(s, k)) for k in PHASE3_SWITCHES},
+            **{k: [str(p) for p in (getattr(s, k) or []) if isinstance(p, str)] for k in PHASE3_FOLDER_LISTS},
+            "realtime_max_file_size": s.realtime_max_file_size,
+            "realtime_limits": {"realtime_max_file_size": {"min": REALTIME_MAX_FILE[0],
+                                                           "max": REALTIME_MAX_FILE[1]}},
+            "realtime_defaults": self.default_folders(),
+            "autostart": self.autostart_view(),
         }
 
     def update_settings(self, body: dict) -> dict:
         changes_limits, priority, threads, trust_signed = {}, None, None, None
         phase2: dict = {}
+        phase3: dict = {}
         for key, value in body.items():
+            if key in PHASE3_SWITCHES:
+                if not isinstance(value, bool):
+                    raise ApiError(400, f"{PHASE3_SWITCHES[key]} must be on or off.")
+                phase3[key] = value
+                continue
+            if key in PHASE3_FOLDER_LISTS:
+                phase3[key] = self._folder_list(key, value)
+                continue
+            if key == "realtime_max_file_size":
+                lo, hi, msg = REALTIME_MAX_FILE
+                if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                        or value != int(value) or not lo <= value <= hi):
+                    raise ApiError(400, msg)
+                phase3[key] = int(value)
+                continue
             if key in PHASE2_SWITCHES:
                 if not isinstance(value, bool):
                     raise ApiError(400, f"{PHASE2_SWITCHES[key]} must be on or off.")
@@ -1047,8 +1729,10 @@ class App:
             if not lo <= value <= hi:
                 raise ApiError(400, f"'{key}' must be between {lo:g} and {hi:g}.")
             changes_limits[key] = kind(value)
-        if not changes_limits and priority is None and threads is None and trust_signed is None and not phase2:
+        if (not changes_limits and priority is None and threads is None and trust_signed is None
+                and not phase2 and not phase3):
             raise ApiError(400, "Nothing to change.")
+        before = {k: getattr(self.settings, k) for k in phase3}
         # save onto what is on disk (so a --port given on the command line is not stored)
         disk = load_settings(self.settings.data_dir)
         for target in (disk, self.settings):
@@ -1062,8 +1746,25 @@ class App:
                 target.trust_signed_programs = trust_signed
             for k, v in phase2.items():
                 setattr(target, k, v)
+            for k, v in phase3.items():
+                setattr(target, k, list(v) if isinstance(v, list) else v)
         disk.save()
         message = "Saved. The new settings apply to the next scan."
+        changed3 = {k for k, v in phase3.items() if before.get(k) != v}
+        if not self.settings.ransomware_guard and (
+                "ransomware_guard" in changed3
+                or ("realtime_enabled" in changed3 and not self.settings.realtime_enabled)):
+            self.remove_decoys_after_guard()
+        if "realtime_enabled" in changed3:
+            self.apply_guard()
+            message += (" Real-time protection is on." if self.settings.realtime_enabled
+                        else " Real-time protection is off.")
+        elif changed3 - {"start_at_sign_in"} and self.settings.realtime_enabled:
+            message += " Real-time protection picks up the change within a few seconds."
+        if "start_at_sign_in" in changed3 or ("start_at_sign_in" in phase3 and self._installed_copy()
+                                              and autostart.enabled(self.autostart_key)
+                                              != self.settings.start_at_sign_in):
+            message += " " + self.apply_autostart()
         if "learning_enabled" in phase2:
             self.sync_learning()
         if "auto_update" in phase2:
@@ -1370,6 +2071,182 @@ class Api:
             raise ApiError(409, "TacoGuard is already using what it learned about that rule.")
         return {"ok": True, "message": f"TacoGuard uses what you taught it about rule '{rule}' again.",
                 **self._learning_view()}
+
+    # ---- real-time protection (Phase 3) --------------------------------------------------------
+    @route("GET", r"/api/protection")
+    def get_protection(self, m, q, body):
+        return self.app.protection_view()
+
+    @staticmethod
+    def _id(body) -> int:
+        v = body.get("id")
+        if isinstance(v, bool) or not isinstance(v, int) or not 0 < v < 2**62:
+            raise ApiError(400, "Say which one.")
+        return v
+
+    @staticmethod
+    def _action(body, allowed: tuple[str, ...]) -> str:
+        a = body.get("action")
+        if not isinstance(a, str) or a not in allowed:
+            raise ApiError(400, "That action isn't possible here.")
+        return a
+
+    def _resolve_event(self, event_id, action: str) -> None:
+        if event_id:
+            self.store.set_guard_event(int(event_id), state="resolved", action=action)
+
+    def _finish_paused_event(self, row: dict, action: str) -> None:
+        """The event that paused this program is resolved once none of its programs is still paused."""
+        if not row.get("event_id"):
+            return
+        others = [p for p in self.store.list_paused(("paused",))
+                  if p["event_id"] == row["event_id"] and p["id"] != row["id"]]
+        if others:
+            self.store.set_guard_event(int(row["event_id"]), action=action)
+        else:
+            self._resolve_event(row["event_id"], action)
+
+    @staticmethod
+    def _quarantined_msg(short: str, findings: list) -> str:
+        why = _findings_reason(findings)
+        return f"Quarantined: {short}." + (f" {why}." if why else "") + " Restore it only if you're sure it's safe."
+
+    @route("POST", r"/api/protection/event")
+    def post_protection_event(self, m, q, body):
+        eid = self._id(body)
+        action = self._action(body, ("seen", "dismiss", "trust", "quarantine"))
+        ev = self.store.get_guard_event(eid)
+        if not ev:
+            raise ApiError(404, "That alert no longer exists.")
+        short = _short(ev["path"]) if ev["path"] else ""
+        if action == "seen":
+            if ev["state"] == "new":
+                self.store.set_guard_event(eid, state="seen")
+            return {"ok": True, "message": "Marked as seen."}
+        if action == "dismiss":
+            self.store.set_guard_event(eid, state="resolved", action=ev["action"] or "dismissed")
+            return {"ok": True, "message": "Dismissed. It stays in the history below."}
+        if not ev["path"] or ev["kind"] not in ("file", "process"):
+            raise ApiError(400, "This alert isn't about a file or a program, so there is nothing to trust or "
+                                "quarantine here.")
+        if ev["action"] in ("quarantined", "deleted"):
+            raise ApiError(409, f"{short} is already in quarantine or deleted.")
+        if action == "trust":
+            if ev["action"] == "trusted":
+                raise ApiError(409, f"{short} is already on your trusted list.")
+            sha = (ev["sha256"] or "").lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", sha):
+                raise ApiError(400, "This file has no fingerprint (it couldn't be read), so it can't be trusted "
+                                    "by its fingerprint. Scan it again from the Scan tab first.")
+            self.store.add_verdict(sha, ev["path"], "not_a_threat", ev["findings"])
+            allow_id = allowlist.trust_hash(self.store, sha, "You said: not a threat", ev["path"])
+            self.app.sync_learning()
+            self._resolve_event(eid, "trusted")
+            return {"ok": True, "allow_id": allow_id,
+                    "message": f"Trusted: {short}. You said it's not a threat. TacoGuard remembers this exact "
+                               "file and won't flag it again. You can undo this in the Trusted list."}
+        data = ev["data"] if isinstance(ev["data"], dict) else {}
+        try:
+            rid = int(data.get("result_id") or 0)
+        except (TypeError, ValueError):
+            rid = 0
+        findings = [Finding.from_dict(f) for f in ev["findings"] if isinstance(f, dict)]
+        reason = ev["message"] or _findings_reason(ev["findings"]) or ev["title"]
+        qid = self.app.quarantine().put(ev["path"], reason, findings, result_id=rid)
+        if rid and self.store.get_result(rid):
+            self.store.set_result_action(rid, "quarantined")
+        self._resolve_event(eid, "quarantined")
+        return {"ok": True, "quarantine_id": qid, "message": self._quarantined_msg(short, ev["findings"])}
+
+    @route("POST", r"/api/protection/paused")
+    def post_protection_paused(self, m, q, body):
+        paused_id = self._id(body)
+        action = self._action(body, ("resume", "end", "quarantine"))
+        row = self.store.get_paused(paused_id)
+        if not row:
+            raise ApiError(404, "That paused program is no longer listed.")
+        short = _short(row["exe"]) if row["exe"] else (row["name"] or "The program")
+        if row["state"] != "paused":
+            raise ApiError(409, f"{short} isn't paused any more.")
+        ref = procctl.ProcRef(int(row["pid"]), float(row["create_time"]))
+        ev = self.store.get_guard_event(int(row["event_id"])) if row["event_id"] else None
+        if action == "resume":
+            try:
+                procctl.resume(ref)
+            except procctl.ProcError as e:
+                if not procctl.is_alive(ref):
+                    self.store.set_paused_state(paused_id, "gone")
+                raise ApiError(409, str(e))
+            self.store.set_paused_state(paused_id, "resumed")
+            self._finish_paused_event(row, "resumed")
+            return {"ok": True, "message": f"Resumed: {short}. It runs normally again."}
+        if action == "quarantine" and not row["exe"]:
+            raise ApiError(400, "TacoGuard doesn't know which file this program runs from, so it can't "
+                                "quarantine it. Use End it instead.")
+        if procctl.is_alive(ref):
+            try:
+                procctl.terminate(ref)
+            except procctl.ProcError as e:
+                if procctl.is_alive(ref):
+                    raise ApiError(409, str(e))
+        self.store.set_paused_state(paused_id, "ended")
+        if action == "end":
+            self._finish_paused_event(row, "ended")
+            return {"ok": True, "message": f"Ended: {short}. Its program file is still there: scan it or "
+                                           "quarantine it if you're not sure about it."}
+        findings_raw = (ev or {}).get("findings") or []
+        findings = [Finding.from_dict(f) for f in findings_raw if isinstance(f, dict)]
+        reason = (ev or {}).get("message") or row["reason"] or "Paused by TacoGuard's real-time protection."
+        try:
+            qid = self.app.quarantine().put(row["exe"], reason, findings, result_id=0)
+        except (quarantine.QuarantineError, ValueError) as e:
+            raise ApiError(400, f"{short} was ended, but its file could not be quarantined: "
+                                f"{str(e) or 'that did not work'}")
+        except OSError as e:
+            self.app.log.error("quarantine after end failed\n%s", traceback.format_exc())
+            raise ApiError(400, f"{short} was ended, but its file could not be quarantined "
+                                f"({plain_error(e)}). Try Quarantine again from the alert.")
+        self._finish_paused_event(row, "quarantined")
+        return {"ok": True, "quarantine_id": qid, "message": self._quarantined_msg(short, findings_raw)}
+
+    def _persistence(self):
+        """A PersistenceWatcher made just for one action (guard/persistence.py, Helper K)."""
+        mod = self.app._optional(_load_persistence)
+        if mod is None or not hasattr(mod, "PersistenceWatcher"):
+            raise ApiError(503, PERSISTENCE_NOT_READY)
+        return mod.PersistenceWatcher(self.settings, self.store, checker=None)
+
+    STARTUP_FROM = {"keep": ("new",), "undo": ("new", "kept"), "restore": ("undone",)}
+    STARTUP_DONE = {"keep": "kept", "undo": "undone", "restore": "restored"}
+
+    @route("POST", r"/api/protection/startup")
+    def post_protection_startup(self, m, q, body):
+        key = body.get("key")
+        if not isinstance(key, str) or not 0 < len(key) <= 4000:
+            raise ApiError(400, "Say which start-up entry.")
+        action = self._action(body, ("keep", "undo", "restore"))
+        row = self.store.get_persistence(key)
+        if not row:
+            raise ApiError(404, "That start-up entry is no longer listed.")
+        name = row["name"] or "This entry"
+        if row["state"] not in self.STARTUP_FROM[action]:
+            words = {"keep": (f"'{name}' was undone: use Put it back to restore it." if row["state"] == "undone"
+                              else f"'{name}' was already handled."),
+                     "undo": f"'{name}' can't be undone from here now.",
+                     "restore": f"'{name}' wasn't undone, so there is nothing to put back."}
+            raise ApiError(409, words[action])
+        watcher = self._persistence()
+        out = getattr(watcher, action)(key)
+        if action == "keep":
+            after = self.store.get_persistence(key)
+            if after and after["state"] == row["state"]:
+                self.store.put_persistence(key, state="kept")
+        defaults = {"keep": f"Kept: '{name}' stays in your start-up programs.",
+                    "undo": f"Undone: '{name}' won't start with Windows any more. TacoGuard kept a copy, so "
+                            "you can put it back.",
+                    "restore": f"Put back: '{name}' starts with Windows again."}
+        self._resolve_event(row.get("event_id"), self.STARTUP_DONE[action])
+        return {"ok": True, "message": out.strip() if isinstance(out, str) and out.strip() else defaults[action]}
 
     # ---- quarantine -------------------------------------------------------------------------
     @route("GET", r"/api/quarantine")
@@ -1790,7 +2667,11 @@ def is_tacoguard_at(port: int, timeout: float = 3.0) -> bool:
         return False
 
 
-def serve(settings, open_browser: bool = True) -> int:
+def serve(settings, open_browser: bool = True, guard: bool | None = None) -> int:
+    """The page. guard=None starts real-time protection (the guard process, when
+    settings.realtime_enabled) except while pytest runs: a test never starts the real guard."""
+    if guard is None:
+        guard = not os.environ.get("PYTEST_CURRENT_TEST")
     app = App(settings)
     port = settings.port
     try:
@@ -1810,6 +2691,8 @@ def serve(settings, open_browser: bool = True) -> int:
     url = f"http://127.0.0.1:{app.port}/"
     app.startup()
     app.start_updates()   # finishes an update cut off last time, then checks (settings.auto_update)
+    if guard:
+        app.start_guard()  # real-time protection (settings.realtime_enabled), stopped by app.close()
     defender.peek()  # start reading Defender's status in the background
     print(f"TacoGuard is running at {url}")
     print("Keep this window open while you use the page. Press Ctrl+C here to stop.")

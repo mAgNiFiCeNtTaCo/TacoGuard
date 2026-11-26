@@ -98,6 +98,18 @@ class Settings:
     # too many text strings). Was 64 MB.
     ml_max_file_size: int = 16 * 1024**2
     learning_enabled: bool = True             # adjust trust from YOUR verdicts only (tacoguard/learning.py)
+    # ---- Phase 3: real-time protection (tacoguard/guard/, contract in guard/__init__.py) -----
+    realtime_enabled: bool = True             # the guard process runs while TacoGuard runs
+    start_at_sign_in: bool = True             # HKCU Run entry for the installed copy (autostart.py)
+    watch_folders: list = field(default_factory=list)   # [] = the defaults (guard.default_watch_folders)
+    watch_processes: bool = True              # check each newly started program once
+    pause_malware_processes: bool = True      # a strong "malware" result pauses that program, then asks
+    ransomware_guard: bool = True             # decoy files + mass-change check
+    ransomware_pause: bool = True             # pause the programs writing when a decoy is changed
+    canary_folders: list = field(default_factory=list)  # [] = Documents, Desktop, Pictures, Downloads
+    persistence_watch: bool = True            # report new start-up entries
+    realtime_max_file_size: int = 256 * 1024**2   # bigger new files: noted, "scan it from the Scan tab"
+    realtime_clamav_second_opinion: bool = True   # start ClamAV only for a file another check flagged
     # ---- derived paths -------------------------------------------------------------
     @property
     def root(self) -> Path:
@@ -147,10 +159,14 @@ class Settings:
     def updates_dir(self) -> Path:             # trusted metadata state, staging, the update journal
         return self.root / "updates"
 
+    @property
+    def guard_dir(self) -> Path:               # Phase 3: decoy manifest, start-up entry backups
+        return self.root / "guard"
+
     def ensure_dirs(self) -> None:
         for p in (self.root, self.clamav_program_dir.parent, self.clamav_db_dir, self.yara_dir,
                   self.hashset_dir, self.quarantine_dir, self.tmp_dir, self.log_dir, self.ml_dir,
-                  self.updates_dir):
+                  self.updates_dir, self.guard_dir):
             p.mkdir(parents=True, exist_ok=True)
 
     # ---- load / save ---------------------------------------------------------------

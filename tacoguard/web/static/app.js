@@ -4,12 +4,13 @@
 (function () {
   const TOKEN = document.querySelector('meta[name="tacoguard-token"]').content;
   const $ = (id) => document.getElementById(id);
-  const VIEWS = ["home", "scan", "detections", "quarantine", "trusted", "settings"];
+  const VIEWS = ["home", "protection", "scan", "detections", "quarantine", "trusted", "settings"];
 
   const state = {
     view: "home", status: null, jobId: null, jobSig: "", targets: [], browsePath: "",
     quickLoaded: false, setupWatch: false, timer: null, settingsLoaded: false,
     notCheckedShown: 0,
+    prot: null, protTimer: null, protSig: "", p3: null,
   };
 
   // ---- small helpers -------------------------------------------------------------------
@@ -121,6 +122,7 @@
       if (a.dataset.view === name) a.setAttribute("aria-current", "page");
       else a.removeAttribute("aria-current");
     }
+    if (name === "protection") { state.protSig = ""; if (state.prot) renderProtection(state.prot); scheduleProt(0); }
     if (name === "scan") { loadQuick(); renderScan(true); }
     if (name === "detections") loadDetections();
     if (name === "quarantine") loadQuarantine();
@@ -158,10 +160,18 @@
     for (const n of st.notes || []) notes.appendChild(el("p", { class: "banner info", text: n }));
 
     const c = st.counts || {};
+    const pr = st.protection || {};
     const line = $("protection-line"), detail = $("protection-detail");
     const card = $("card-protection");
     card.className = "card";
     $("protection-link").hidden = !c.open_detections;
+    $("protection-rt-link").hidden = !pr.attention;
+    const rtLine = $("protection-rt");
+    rtLine.textContent = pr.summary || "";
+    rtLine.className = "small" + (pr.state === "on" ? "" : " muted");
+    if (pr.attention) {
+      rtLine.textContent = plural(pr.attention, "alert") + " from real-time protection " + (pr.attention === 1 ? "is" : "are") + " waiting for you. " + (pr.summary || "");
+    }
     if (c.open_malware) {
       card.classList.add("is-bad");
       line.textContent = "Malware found in " + plural(c.open_malware, "file") + ". You decide what to do with it.";
@@ -174,8 +184,9 @@
       line.textContent = "Scanning now.";
       detail.textContent = "";
     } else {
-      line.textContent = "Nothing is waiting for you.";
-      detail.textContent = "TacoGuard checks files when you ask. Microsoft Defender stays your always-on protection.";
+      line.textContent = pr.attention ? "No scan results are waiting for you." : "Nothing is waiting for you.";
+      detail.textContent = pr.alive ? "Microsoft Defender stays your main always-on protection; TacoGuard is the second opinion next to it."
+        : "TacoGuard checks files when you ask. Microsoft Defender stays your always-on protection.";
     }
 
     const df = st.defender || {};
@@ -537,21 +548,25 @@
   function renderBrowse(b) {
     state.browsePath = b.path || "";
     $("browse-add").disabled = !state.browsePath;
-    const crumbs = clear($("browse-crumbs"));
-    crumbs.appendChild(el("button", { type: "button", class: "crumb", text: "This PC", onclick: () => browseTo("") }));
+    drawBrowse($("browse-crumbs"), $("browse-list"), b, browseTo);
+  }
+  // The folder list of one /api/browse answer (Scan tab and the Settings folder pickers).
+  function drawBrowse(crumbsBox, listBox, b, go) {
+    const crumbs = clear(crumbsBox);
+    crumbs.appendChild(el("button", { type: "button", class: "crumb", text: "This PC", onclick: () => go("") }));
     if (b.path) {
       const parts = b.path.replace(/\\+$/, "").split("\\");
       let acc = "";
       parts.forEach((p, i) => {
         acc = i === 0 ? p + "\\" : (acc.endsWith("\\") ? acc : acc + "\\") + p;
         const target = acc;
-        crumbs.append(el("span", { class: "sep", text: ">" }), el("button", { type: "button", class: "crumb", text: p, onclick: () => browseTo(target) }));
+        crumbs.append(el("span", { class: "sep", text: ">" }), el("button", { type: "button", class: "crumb", text: p, onclick: () => go(target) }));
       });
     }
-    const list = clear($("browse-list"));
-    if (b.parent) list.appendChild(el("li", {}, el("button", { type: "button", class: "folder up", text: ".. (up one level)", onclick: () => browseTo(b.parent) })));
+    const list = clear(listBox);
+    if (b.parent) list.appendChild(el("li", {}, el("button", { type: "button", class: "folder up", text: ".. (up one level)", onclick: () => go(b.parent) })));
     for (const f of b.folders || []) {
-      list.appendChild(el("li", {}, el("button", { type: "button", class: "folder", text: f.name, title: f.path, onclick: () => browseTo(f.path) })));
+      list.appendChild(el("li", {}, el("button", { type: "button", class: "folder", text: f.name, title: f.path, onclick: () => go(f.path) })));
     }
     if (!(b.folders || []).length) list.appendChild(el("li", { class: "muted small", text: b.drives ? "No drives found." : "No sub-folders here." }));
   }
@@ -815,6 +830,7 @@
       const s = await api("/api/settings");
       fillLimits(s);
       fillPhase2(s);
+      fillPhase3(s);
       renderSigners(s.signers || []);
       loadLearned();
       const ep = clear($("endpoints"));
@@ -969,7 +985,321 @@
     toast(out.message);
   }));
 
+  // ---- Protection (Phase 3: real-time protection) -----------------------------------------------
+  // Polled every 3 s while the tab is open and the window visible, else every 30 s (tab badge).
+  function scheduleProt(ms) { clearTimeout(state.protTimer); state.protTimer = setTimeout(protTick, ms); }
+  async function protTick() {
+    clearTimeout(state.protTimer);
+    try {
+      const p = await api("/api/protection");
+      state.prot = p;
+      renderProtBadge(p);
+      if (state.view === "protection") renderProtection(p);
+    } catch (e) { /* offline banner is shown by api() */ }
+    scheduleProt(state.view === "protection" && document.visibilityState === "visible" ? 3000 : 30000);
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && state.view === "protection") scheduleProt(0);
+  });
+
+  function renderProtBadge(p) {
+    const c = p.counts || {};
+    const badge = $("badge-protection");
+    badge.hidden = !c.attention;
+    badge.textContent = c.attention || "";
+    badge.className = "badge" + (c.malware ? " bad" : " warn");
+  }
+
+  const GUARD_DOTS = { on: "ok", warn: "warn", error: "warn", starting: "none", off: "none", unavailable: "none" };
+  const PART_WORDS = { on: "On", off: "Off (Settings)", starting: "Starting...", error: "Not working" };
+  const LEVEL_WORDS = { malware: "Malware", suspicious: "Suspicious", warning: "Needs a look", info: "Note" };
+  const ACTION_WORDS = { resumed: "You let it run again", ended: "You ended it", quarantined: "Quarantined",
+                         trusted: "You trusted it", kept: "You kept it", undone: "You undid it",
+                         restored: "You put it back", dismissed: "Dismissed" };
+
+  function renderProtection(p) {
+    renderGuardStatus(p.guard || {}, p.autostart || {});
+    renderCfa(p.cfa || {});
+    const sig = JSON.stringify([p.paused, p.startup, p.startup_undone, p.attention, (p.events || []).map((e) => [e.id, e.state, e.action])]);
+    if (sig === state.protSig) return;
+    state.protSig = sig;
+    renderAttention(p);
+    renderUndone(p.startup_undone || []);
+    renderHistory3(p.events || []);
+  }
+
+  function renderGuardStatus(g, a) {
+    $("prot-summary").textContent = g.summary || "";
+    $("prot-dot").className = "dot " + (GUARD_DOTS[g.state] || "none");
+    const note = $("prot-note");
+    note.hidden = !g.note;
+    note.textContent = g.note || "";
+    const ul = clear($("prot-parts"));
+    for (const part of g.parts || []) {
+      const bits = [];
+      if ((part.short_watched || []).length) bits.push(part.short_watched.join(", "));
+      if (part.checked) bits.push(Number(part.checked).toLocaleString() + " checked so far");
+      ul.appendChild(el("li", {},
+        el("span", { class: "dot " + ({ on: "ok", error: "warn" }[part.state] || "none") }),
+        el("strong", { text: part.label }), " ",
+        el("span", { text: part.message || PART_WORDS[part.state] || part.state }),
+        bits.length ? el("span", { class: "muted small block", text: bits.join(". ") }) : null));
+    }
+    $("prot-autostart").textContent = a.installed ? (a.message || "")
+      : "This copy runs from its project folder, so it doesn't start by itself when you sign in.";
+  }
+
+  function renderCfa(c) {
+    $("cfa-state").textContent = c.message || "";
+    $("cfa-dot").className = "dot " + ({ on: "ok", audit: "none", off: "none" }[c.state] || "none");
+    $("cfa-note").hidden = !c.note;
+    $("cfa-note").textContent = c.note || "";
+  }
+
+  function protAction(path, body, confirmOpt) {
+    return act(async () => {
+      if (confirmOpt) {
+        const res = await confirmBox(confirmOpt);
+        if (!res.ok) return;
+      }
+      const out = await api(path, body);
+      toast(out.message);
+      state.protSig = "";
+      protTick(); tick();
+    });
+  }
+
+  function cardBtn(label, cls, fn, title) {
+    return el("button", { type: "button", class: "btn " + cls, text: label, title: title, onclick: fn });
+  }
+
+  function renderAttention(p) {
+    const box = clear($("prot-attention"));
+    for (const pr of p.paused || []) box.appendChild(pausedCard(pr));
+    for (const s of p.startup || []) box.appendChild(startupCard(s));
+    const rank = { malware: 0, warning: 1, suspicious: 2, info: 3 };
+    const evs = (p.attention || []).slice().sort((a, b) => (rank[a.level] ?? 4) - (rank[b.level] ?? 4) || b.id - a.id);
+    for (const e of evs) box.appendChild(eventCard(e));
+    if (!box.firstChild) box.appendChild(el("p", { class: "muted", text: "Nothing needs you right now." }));
+  }
+
+  function pausedCard(pr) {
+    const ev = pr.event || {};
+    const name = pr.short || pr.name || "this program";
+    const card = el("article", { class: "result " + (ev.level === "malware" ? "malware" : "warning") });
+    card.appendChild(el("h3", { text: "Paused: " + name }));
+    if (ev.title && ev.title.indexOf(name) < 0) card.appendChild(el("p", { class: "ml-line", text: ev.title }));
+    card.appendChild(el("p", { class: "reason", text: ev.message || pr.reason || "" }));
+    card.appendChild(el("p", { class: "small", text: "The program is frozen until you choose: Resume lets it carry on, End it closes it, Quarantine closes it and locks its file away." }));
+    const meta = ["Paused " + fmtTime(pr.paused_at)];
+    if (pr.name) meta.push(pr.name + " (process " + pr.pid + ")");
+    if (pr.exe && pr.exe !== name) meta.push(pr.exe);
+    card.appendChild(el("p", { class: "muted small", text: meta.join("  |  ") }));
+    const send = (action, confirmOpt) => () => protAction("/api/protection/paused", { id: pr.id, action: action }, confirmOpt);
+    card.appendChild(el("div", { class: "actions" },
+      cardBtn("Resume", "quiet", send("resume")),
+      cardBtn("End it", "warn", send("end", {
+        title: "End this program?",
+        text: [name, "TacoGuard closes the paused program now. Anything it hadn't saved is lost.",
+          "Its file stays where it is, so you can scan it or quarantine it afterwards."],
+        ok: "End it", danger: true })),
+      cardBtn("Quarantine", "danger", send("quarantine", {
+        title: "End it and quarantine its file?",
+        text: [pr.exe || name, "TacoGuard closes the paused program, then locks its file away in encrypted form so it can't run.",
+          "If it turns out to be safe, you can restore it from the Quarantine tab."],
+        ok: "Quarantine", danger: true }))));
+    return card;
+  }
+
+  function startupCard(s) {
+    const ev = s.event || {};
+    const card = el("article", { class: "result " + ({ malware: "malware", suspicious: "suspicious", info: "info" }[ev.level] || "warning") });
+    card.appendChild(el("h3", { text: "New start-up entry: '" + (s.name || "") + "'" }));
+    card.appendChild(el("p", { class: "small", text: (s.location || "") + (s.short_target ? ". It starts " + s.short_target : "") }));
+    if (s.command) card.appendChild(el("p", { class: "mono small cmd", text: s.command }));
+    if (ev.message) card.appendChild(el("p", { class: "reason", text: ev.message }));
+    card.appendChild(el("p", { class: "muted small", text: "Programs often add an entry like this when you install or update them. If you didn't just install something, Undo it: TacoGuard keeps a copy, so you can put it back." }));
+    card.appendChild(el("p", { class: "muted small", text: "Noticed " + fmtTime(s.first_seen) }));
+    const send = (action) => () => protAction("/api/protection/startup", { key: s.key, action: action });
+    card.appendChild(el("div", { class: "actions" },
+      cardBtn("Keep", "quiet", send("keep")), cardBtn("Undo", "warn", send("undo"))));
+    return card;
+  }
+
+  function renderUndone(list) {
+    const box = clear($("prot-undone"));
+    $("prot-undone-box").hidden = !list.length;
+    for (const s of list) {
+      box.appendChild(el("article", { class: "result info" },
+        el("h3", { text: "Undone: '" + (s.name || "") + "'" }),
+        el("p", { class: "small", text: (s.location || "") + (s.short_target ? ". It started " + s.short_target : "") }),
+        s.command ? el("p", { class: "mono small cmd", text: s.command }) : null,
+        el("div", { class: "actions" }, cardBtn("Put it back", "quiet",
+          () => protAction("/api/protection/startup", { key: s.key, action: "restore" })))));
+    }
+  }
+
+  function isFileEvent(e) { return !!e.path && (e.kind === "file" || e.kind === "process"); }
+
+  function eventCard(e) {
+    const name = e.short || e.path || "";
+    const cls = { malware: "malware", suspicious: "suspicious", warning: "warning" }[e.level] || "info";
+    const card = el("article", { class: "result " + cls });
+    const suspiciousFile = isFileEvent(e) && e.level === "suspicious";
+    card.appendChild(el("h3", { text: suspiciousFile ? "Suspicious (not quarantined): " + name : (e.title || name) }));
+    if (e.ml_score !== null && e.ml_score !== undefined) {
+      card.appendChild(el("p", { class: "ml-line", text: "ML score " + Number(e.ml_score).toFixed(2) +
+        (e.signature_match ? ", and a signature or rule matched too." : ", no signature match.") }));
+    }
+    if (e.message) card.appendChild(el("p", { class: "reason", text: e.message }));
+    const meta = [];
+    if (e.path && e.path !== name) meta.push(e.path);
+    meta.push(fmtTime(e.created));
+    card.appendChild(el("p", { class: "muted small", text: meta.join("  |  ") }));
+    const send = (action, confirmOpt) => () => protAction("/api/protection/event", { id: e.id, action: action }, confirmOpt);
+    const acts = el("div", { class: "actions" });
+    if (isFileEvent(e)) {
+      const rescan = () => act(async () => {
+        const out = await api("/api/scan", { targets: [e.path] });
+        toast("Scanning " + name + " again.");
+        openJob(out.job_id);
+      });
+      const trust = send("trust", {
+        title: e.level === "malware" ? "Mark as not a threat?" : "Trust this file?",
+        text: [name,
+          "TacoGuard will remember this exact file by its fingerprint (SHA-256 hash) and won't flag it again, wherever it is. If the file changes, it will be checked again.",
+          e.level === "malware" ? "This was a strong match. Only do this if you know where the file came from and trust it."
+            : "Weaker matches like this are often false alarms, for example game mods or tools.",
+          "You can undo this any time in the Trusted list."],
+        ok: e.level === "malware" ? "Not a threat" : "Trust this file" });
+      if (e.level === "malware") {
+        acts.append(cardBtn("Quarantine", "danger", send("quarantine")), cardBtn("Not a threat", "quiet", trust), cardBtn("Scan again", "quiet", rescan));
+      } else {
+        acts.append(cardBtn("Scan again", "quiet", rescan), cardBtn("Trust this file", "quiet", trust), cardBtn("Quarantine", "warn", send("quarantine")));
+      }
+    }
+    acts.appendChild(cardBtn("Dismiss", "link", send("dismiss"), "Takes it off this list. It stays in the history."));
+    card.appendChild(acts);
+    return card;
+  }
+
+  function renderHistory3(events) {
+    $("prot-history-count").textContent = events.length;
+    const box = clear($("prot-history"));
+    if (!events.length) { box.appendChild(el("p", { class: "muted small", text: "Nothing yet." })); return; }
+    const ul = el("ul", { class: "history" });
+    for (const e of events) {
+      const what = e.action ? (ACTION_WORDS[e.action] || e.action) : (e.state === "resolved" ? "Handled" : "Waiting for you");
+      ul.appendChild(el("li", {},
+        el("div", {},
+          el("span", { class: "nc-kind lvl-" + e.level, text: LEVEL_WORDS[e.level] || e.level }), " ",
+          el("strong", { text: e.title || e.short || "" }),
+          el("span", { class: "muted small block", text: [fmtTime(e.created), what].join(". ") })),
+        e.state !== "resolved" ? el("div", { class: "actions tight" },
+          cardBtn("Dismiss", "quiet", () => protAction("/api/protection/event", { id: e.id, action: "dismiss" }))) : null));
+    }
+    box.appendChild(ul);
+  }
+
+  // ---- Settings: real-time protection (Phase 3) --------------------------------------------------
+  const P3_SWITCHES = ["realtime_enabled", "start_at_sign_in", "watch_processes", "pause_malware_processes",
+                       "ransomware_guard", "ransomware_pause", "persistence_watch", "realtime_clamav_second_opinion"];
+  const FOLDER_LISTS = { watch: "watch_folders", canary: "canary_folders" };
+
+  function fillPhase3(s) {
+    const f = $("phase3-form");
+    for (const k of P3_SWITCHES) if (f.elements[k]) f.elements[k].checked = !!s[k];
+    f.elements.realtime_max_file_size.value = Math.round(Number(s.realtime_max_file_size) / MB);
+    const defaults = s.realtime_defaults || {};
+    state.p3 = { defaults: { watch: defaults.watch_folders || [], canary: defaults.canary_folders || [] } };
+    for (const [which, key] of Object.entries(FOLDER_LISTS)) {
+      state.p3[which] = (s[key] || []).length ? s[key].slice() : null;      // null = the defaults
+      renderFolderList(which);
+    }
+    const a = s.autostart || {};
+    $("autostart-note").textContent = a.installed
+      ? "Adds TacoGuard to your own start-up programs (no admin rights). It starts quietly, without opening this page. " + (a.message || "")
+      : (a.note || "");
+    syncPhase3();
+  }
+  function syncPhase3() {
+    const f = $("phase3-form");
+    const on = f.elements.realtime_enabled.checked;
+    f.elements.pause_malware_processes.disabled = !on || !f.elements.watch_processes.checked;
+    f.elements.ransomware_pause.disabled = !on || !f.elements.ransomware_guard.checked;
+    for (const k of ["watch_processes", "ransomware_guard", "persistence_watch", "realtime_clamav_second_opinion", "realtime_max_file_size"]) {
+      f.elements[k].disabled = !on;
+    }
+  }
+  for (const k of ["realtime_enabled", "watch_processes", "ransomware_guard"]) {
+    $("phase3-form").elements[k].addEventListener("change", syncPhase3);
+  }
+
+  function renderFolderList(which) {
+    const ul = clear($(which + "-list"));
+    const list = state.p3[which];
+    const shown = list === null ? state.p3.defaults[which] : list;
+    shown.forEach((path, i) => {
+      ul.appendChild(el("li", { class: "chip" + (list === null ? " default" : "") }, el("span", { text: path }),
+        el("button", { type: "button", class: "x", "aria-label": "Remove " + path, title: "Remove", text: "x",
+          onclick: () => {
+            if (state.p3[which] === null) state.p3[which] = state.p3.defaults[which].slice();
+            state.p3[which].splice(i, 1);
+            renderFolderList(which);
+          } })));
+    });
+    if (list === null) ul.appendChild(el("li", { class: "muted small", text: shown.length ? "(the defaults)" : "No default folders found on this PC." }));
+    else ul.appendChild(el("li", {}, el("button", { type: "button", class: "btn link", text: "Use the defaults",
+      onclick: () => { state.p3[which] = null; renderFolderList(which); } })));
+  }
+  function addFolder(which, path) {
+    if (state.p3[which] === null) state.p3[which] = state.p3.defaults[which].slice();
+    if (!state.p3[which].some((p) => p.toLowerCase() === path.toLowerCase())) state.p3[which].push(path);
+    renderFolderList(which);
+  }
+
+  // A small folder picker: type a path, or browse (the same folder list as the Scan tab).
+  function folderAdder(box, onAdd) {
+    const input = el("input", { type: "text", placeholder: "Type a folder, for example D:\\Games", spellcheck: "false", "aria-label": "Folder to add" });
+    const add = () => { const v = input.value.trim().replace(/^"|"$/g, ""); if (v) { onAdd(v); input.value = ""; } };
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); add(); } });
+    const crumbs = el("div", { class: "crumbs" });
+    const err = el("p", { class: "error small", hidden: true });
+    const list = el("ul", { class: "folders" });
+    let current = "";
+    const pick = el("button", { type: "button", class: "btn quiet", text: "Add this folder", disabled: true, onclick: () => { if (current) onAdd(current); } });
+    const go = async (path) => {
+      try {
+        err.hidden = true;
+        const b = await api("/api/browse?path=" + encodeURIComponent(path));
+        current = b.path || ""; pick.disabled = !current;
+        drawBrowse(crumbs, list, b, go);
+      } catch (e) { err.textContent = e.message; err.hidden = false; }
+    };
+    const det = el("details", { class: "browser" }, el("summary", { text: "Browse folders" }), crumbs, err, list, el("div", { class: "actions" }, pick));
+    let loaded = false;
+    det.addEventListener("toggle", () => { if (det.open && !loaded) { loaded = true; go(""); } });
+    box.append(el("div", { class: "row" }, input, el("button", { type: "button", class: "btn quiet", text: "Add folder", onclick: add })), det);
+  }
+  folderAdder($("watch-add"), (p) => addFolder("watch", p));
+  folderAdder($("canary-add"), (p) => addFolder("canary", p));
+
+  $("phase3-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const f = e.target, body = {};
+    for (const k of P3_SWITCHES) body[k] = f.elements[k].checked;
+    if (f.elements.realtime_max_file_size.value !== "") body.realtime_max_file_size = Number(f.elements.realtime_max_file_size.value) * MB;
+    for (const [which, key] of Object.entries(FOLDER_LISTS)) body[key] = state.p3[which] || [];
+    act(async () => {
+      const out = await api("/api/settings", body);
+      $("phase3-msg").textContent = out.message;
+      fillPhase3(out.settings);
+      protTick(); tick();
+    });
+  });
+
   // ---- start -----------------------------------------------------------------------------------
   showView(location.hash.slice(1) || "home");
   tick();
+  if (state.view !== "protection") protTick();
 })();

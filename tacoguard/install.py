@@ -17,7 +17,11 @@ Layout of config.install_root() (%LOCALAPPDATA%\\Programs\\TacoGuard):
     health.json, update.lock, update_result.json   self-update state (tacoguard/selfupdate.py)
 
 The data folder (D:\\TacoGuard: settings, database, quarantine) is never inside the install folder
-and uninstall never touches it. No service, scheduled task or autostart is created.
+and uninstall never touches it. No service or scheduled task is created. Phase 3: when
+settings.start_at_sign_in is on, install adds ONE value to your own Run key (tacoguard/autostart.py:
+the installed launcher with --background); uninstall removes it again, and removes the guard's
+decoy files (tacoguard/guard/ransom.py). A custom `root` (tests) never touches the Run key unless
+asked (autostart=True with a test key).
 
 A release package (what self-update installs) is a zip with the same files as versions\\<version>\\:
 build it with build_package(); selfupdate.py unpacks and checks it.
@@ -600,13 +604,125 @@ def make_shortcut(root: Path, shortcut_dir: Path) -> Path:
     return lnk
 
 
+def apply_autostart(settings, root: Path, key_path: str | None = None) -> str:
+    """Start at sign-in for the installed copy in `root`, as settings.start_at_sign_in says.
+    Returns a plain sentence for the install message ("" when nothing was asked)."""
+    from . import autostart
+    try:
+        if getattr(settings, "start_at_sign_in", False):
+            return autostart.enable(root, key_path=key_path) + " (Change this in Settings.)"
+        return autostart.disable(key_path=key_path, only_for_root=root)
+    except autostart.AutostartError as e:
+        return f"TacoGuard could not set itself to start when you sign in: {e}"
+
+
+GUARD_STOP_WAIT_S = 10.0
+
+
+def _running_guard(settings):
+    """The guard process of this data folder (its heartbeat's pid, still running with
+    tacoguard.guard in its command line), or None."""
+    db = Path(settings.db_path)
+    if not db.is_file():
+        return None
+    try:
+        import sqlite3
+        import urllib.parse
+        uri = "file:" + urllib.parse.quote(str(db).replace("\\", "/")) + "?mode=ro"
+        con = sqlite3.connect(uri, uri=True, timeout=5)
+        try:
+            row = con.execute("SELECT value FROM meta WHERE key='guard_state'").fetchone()
+        finally:
+            con.close()
+        pid = int(json.loads(row[0]).get("pid") or 0) if row and row[0] else 0
+    except Exception:
+        return None
+    if pid <= 0 or pid == os.getpid():
+        return None
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        return p if "tacoguard.guard" in " ".join(p.cmdline()).lower() else None
+    except Exception:
+        return None
+
+
+def stop_running_guard(settings, wait_s: float = GUARD_STOP_WAIT_S) -> str:
+    """Asks a running guard to stop (its "stop" file, as the page does), waits up to wait_s, then
+    ends it. Returns a plain sentence ("" when no guard ran). Never raises."""
+    p = _running_guard(settings)
+    if p is None:
+        return ""
+    stop = Path(settings.guard_dir) / "stop"
+    try:
+        stop.parent.mkdir(parents=True, exist_ok=True)
+        stop.write_text("stop\n", encoding="utf-8")
+    except OSError:
+        pass
+    note = "Real-time protection was stopped first."
+    try:
+        try:
+            p.wait(wait_s)
+        except Exception:
+            try:
+                p.kill()
+                p.wait(5)
+            except Exception:
+                note = "Real-time protection could not be stopped; it may put its decoy files back."
+    finally:
+        try:
+            stop.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return note
+
+
+def remove_guard_leftovers(settings, root: Path, key_path: str | None = None) -> list[str]:
+    """For uninstall: the start-at-sign-in entry (only when it starts this copy) and the guard's
+    decoy files (a guard still running is stopped first, so it can't put them back). Returns
+    plain sentences. Never raises."""
+    notes = []
+    try:
+        from . import autostart
+        if autostart.enabled(key_path):
+            notes.append(autostart.disable(key_path=key_path, only_for_root=root))
+    except Exception as e:
+        notes.append(f"The start-at-sign-in entry could not be removed ({e}).")
+    try:
+        from .guard import ransom
+    except ImportError:
+        return notes
+    try:
+        stopped = stop_running_guard(settings)
+        if stopped:
+            notes.append(stopped)
+    except Exception:
+        pass
+    try:
+        fn = getattr(ransom, "remove_decoys", None)
+        if callable(fn):
+            n = fn(settings)
+        else:
+            n = ransom.RansomGuard(settings, None, None).remove_decoys()
+        if n:
+            notes.append(f"Removed {n} decoy file{'s' if n != 1 else ''} TacoGuard had made.")
+    except Exception:
+        notes.append("Some of TacoGuard's decoy files could not be removed. They are small hidden files "
+                     "listed in the data folder's guard\\decoys.json.")
+    return notes
+
+
 def install(settings, project_root, shortcut: bool = False, *, deps: str = "pip",
-            root: Path | None = None, shortcut_dir: Path | None = None, progress=None) -> dict:
+            root: Path | None = None, shortcut_dir: Path | None = None, progress=None,
+            autostart: bool | None = None, autostart_key: str | None = None) -> dict:
     """Install (or refresh) the per-user copy. deps="pip" downloads the pinned parts from pypi.org;
     deps="copy" copies them from the Python running this (offline). Running it again changes only
-    what differs. Returns {"ok", "message", "root", "version", "changed": [...]}."""
+    what differs. autostart (None = settings.start_at_sign_in, but only for the default install
+    folder) applies start at sign-in. Returns {"ok", "message", "root", "version", "changed": [...]}."""
     progress = progress or (lambda m: None)
     project_root = Path(project_root).resolve()
+    if autostart is None:
+        autostart = root is None
     root = Path(root or install_root())
     changed: list[str] = []
     try:
@@ -702,12 +818,20 @@ def install(settings, project_root, shortcut: bool = False, *, deps: str = "pip"
                + (" or the Start-menu shortcut." if shortcut else "."))
     else:
         msg = f"TacoGuard {version} is already installed in {root} and up to date."
+    if autostart:
+        note = apply_autostart(settings, root, key_path=autostart_key)
+        if note:
+            msg += " " + note
     return {"ok": True, "message": msg, "root": str(root), "version": version, "changed": changed}
 
 
-def uninstall(settings, *, root: Path | None = None) -> dict:
+def uninstall(settings, *, root: Path | None = None, cleanup: bool | None = None,
+              autostart_key: str | None = None) -> dict:
     """Remove the installed copy: only a folder carrying TacoGuard's marker, never the data
-    folder or quarantine. Returns {"ok", "message"}."""
+    folder or quarantine. cleanup (None = only for the default install folder) also removes the
+    start-at-sign-in entry and the guard's decoy files. Returns {"ok", "message"}."""
+    if cleanup is None:
+        cleanup = root is None
     root = Path(root or install_root())
     marker = read_json(root / MARKER)
     if not root.exists():
@@ -727,12 +851,14 @@ def uninstall(settings, *, root: Path | None = None) -> dict:
             Path(lnk).unlink()
         except OSError:
             pass
+    notes = remove_guard_leftovers(settings, root, key_path=autostart_key) if cleanup else []
     rmtree(root)
+    extra = "".join(" " + n for n in notes)
     if root.exists():
         return {"ok": False, "message": f"Some files in {root} could not be removed (in use?). Close TacoGuard "
-                                        "and run uninstall again."}
+                                        "and run uninstall again." + extra}
     return {"ok": True, "message": f"TacoGuard's installed copy was removed from {root}. Your settings, scan "
-                                   f"history and quarantine in {data} were kept."}
+                                   f"history and quarantine in {data} were kept." + extra}
 
 
 # ---------------------------------------------------------------------------------------------

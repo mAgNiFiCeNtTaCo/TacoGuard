@@ -1,5 +1,5 @@
 """The one SQLite database: scan jobs, notable results, quarantine records, allowlist, verdicts,
-and the clean-file cache.
+the clean-file cache, and (Phase 3) guard events, paused programs and start-up entries.
 
 Safe to use from several threads and from the scan worker process at the same time (WAL mode,
 one connection per thread, busy timeout). Every write is its own short transaction.
@@ -106,6 +106,50 @@ CREATE TABLE IF NOT EXISTS cache (
     sha256 TEXT NOT NULL,
     sig_version TEXT NOT NULL,
     checked REAL NOT NULL
+);
+
+-- ---- Phase 3: real-time protection (contract: tacoguard/guard/__init__.py) ----------------
+CREATE TABLE IF NOT EXISTS guard_events (   -- what the guard saw; the page's Protection tab
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created REAL NOT NULL,
+    kind TEXT NOT NULL,                 -- file|process|ransomware|persistence|guard
+    level TEXT NOT NULL,                -- info|suspicious|malware|warning
+    title TEXT NOT NULL,                -- one plain line: "Paused: Downloads\\x.exe"
+    message TEXT NOT NULL DEFAULT '',   -- plain-English reason (model.explain wording)
+    path TEXT NOT NULL DEFAULT '',      -- display path of the file / program, if any
+    sha256 TEXT NOT NULL DEFAULT '',
+    findings TEXT NOT NULL DEFAULT '[]',
+    data TEXT NOT NULL DEFAULT '{}',    -- JSON extras (pids, entry key, ...)
+    state TEXT NOT NULL DEFAULT 'new',  -- new|seen|resolved
+    action TEXT NOT NULL DEFAULT ''     -- what the user chose: resumed|ended|quarantined|trusted|kept|undone|...
+);
+CREATE INDEX IF NOT EXISTS guard_events_state ON guard_events(state, id);
+
+CREATE TABLE IF NOT EXISTS paused (         -- programs TacoGuard paused (suspended); survives crashes
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pid INTEGER NOT NULL,
+    create_time REAL NOT NULL,          -- psutil create_time: tells a reused pid apart
+    exe TEXT NOT NULL DEFAULT '',       -- display path of the program
+    name TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    event_id INTEGER NOT NULL DEFAULT 0,
+    paused_at REAL NOT NULL,
+    state TEXT NOT NULL DEFAULT 'paused',  -- paused|resumed|ended|gone|not_paused
+    updated REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS persistence (    -- start-up entries: the baseline and what changed
+    key TEXT PRIMARY KEY,               -- stable id, e.g. "run:HKCU:Software\\...\\Run:Name"
+    source TEXT NOT NULL,               -- run|runonce|startup_folder|task|service|winlogon|ifeo|...
+    location TEXT NOT NULL,             -- where it lives, plain ("Your Run key", "Task Scheduler: \\X")
+    name TEXT NOT NULL,
+    command TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT '',    -- display path of the program it starts, if found
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    state TEXT NOT NULL,                -- baseline|new|kept|undone|removed
+    backup TEXT NOT NULL DEFAULT '',    -- JSON needed to restore an undone entry
+    event_id INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -383,6 +427,125 @@ class Store:
         if n > max_rows:
             con.execute("DELETE FROM cache WHERE key IN (SELECT key FROM cache ORDER BY checked LIMIT ?)",
                         (n - max_rows,))
+
+    # ---- small key/value state (meta table) --------------------------------------------------
+    def get_meta(self, key: str) -> str | None:
+        r = self._one("SELECT value FROM meta WHERE key=?", (key,))
+        return r["value"] if r else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._con().execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, value))
+
+    # ---- Phase 3: guard events, paused programs, start-up entries ---------------------------
+    def persistence_fingerprint(self) -> tuple:
+        """Changes whenever a start-up row is added, changed or removed (cheap)."""
+        r = self._con().execute("SELECT COUNT(*), COALESCE(MAX(last_seen), 0), "
+                                "COALESCE(SUM(LENGTH(state)), 0) FROM persistence").fetchone()
+        return (int(r[0]), float(r[1]), int(r[2]))
+
+    def add_guard_event(self, kind: str, level: str, title: str, message: str = "", path: str = "",
+                        sha256: str = "", findings: list | None = None, data: dict | None = None) -> int:
+        cur = self._con().execute(
+            "INSERT INTO guard_events(created, kind, level, title, message, path, sha256, findings, data) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (time.time(), kind, level, title, message, path, sha256, json.dumps(findings or []),
+             json.dumps(data or {})))
+        return int(cur.lastrowid)
+
+    def get_guard_event(self, event_id: int) -> dict | None:
+        r = self._one("SELECT * FROM guard_events WHERE id=?", (event_id,))
+        return _decode_event(r) if r else None
+
+    def list_guard_events(self, states: tuple[str, ...] | None = None, limit: int = 200,
+                          after_id: int = 0) -> list[dict]:
+        """Newest first. `after_id` returns only events newer than that id."""
+        sql, args = "SELECT * FROM guard_events WHERE id>?", [after_id]
+        if states:
+            sql += f" AND state IN ({','.join('?' * len(states))})"
+            args += list(states)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        return [_decode_event(r) for r in self._all(sql, tuple(args))]
+
+    def set_guard_event(self, event_id: int, state: str | None = None, action: str | None = None,
+                        data: dict | None = None, title: str | None = None,
+                        message: str | None = None, level: str | None = None) -> None:
+        sets, args = [], []
+        for col, val in (("state", state), ("action", action), ("title", title), ("message", message),
+                         ("level", level)):
+            if val is not None:
+                sets.append(f"{col}=?")
+                args.append(val)
+        if data is not None:
+            sets.append("data=?")
+            args.append(json.dumps(data))
+        if sets:
+            self._con().execute(f"UPDATE guard_events SET {', '.join(sets)} WHERE id=?", (*args, event_id))
+
+    def trim_guard_events(self, keep: int = 5000) -> None:
+        self._con().execute("DELETE FROM guard_events WHERE id <= (SELECT COALESCE(MAX(id), 0) FROM "
+                            "guard_events) - ? AND state='resolved'", (keep,))
+
+    def add_paused(self, pid: int, create_time: float, exe: str, name: str, reason: str,
+                   event_id: int = 0) -> int:
+        now = time.time()
+        cur = self._con().execute(
+            "INSERT INTO paused(pid, create_time, exe, name, reason, event_id, paused_at, state, updated) "
+            "VALUES(?,?,?,?,?,?,?,'paused',?)", (pid, create_time, exe, name, reason, event_id, now, now))
+        return int(cur.lastrowid)
+
+    def get_paused(self, paused_id: int) -> dict | None:
+        return self._one("SELECT * FROM paused WHERE id=?", (paused_id,))
+
+    def list_paused(self, states: tuple[str, ...] = ("paused",)) -> list[dict]:
+        q = ",".join("?" * len(states))
+        return self._all(f"SELECT * FROM paused WHERE state IN ({q}) ORDER BY id DESC", states)
+
+    def set_paused_state(self, paused_id: int, state: str) -> None:
+        """state: paused|resumed|ended|gone|not_paused (Windows refused the pause; it kept running)."""
+        self._con().execute("UPDATE paused SET state=?, updated=? WHERE id=?", (state, time.time(), paused_id))
+
+    def set_paused_event(self, paused_id: int, event_id: int) -> None:
+        self._con().execute("UPDATE paused SET event_id=?, updated=? WHERE id=?",
+                            (event_id, time.time(), paused_id))
+
+    def get_persistence(self, key: str) -> dict | None:
+        return self._one("SELECT * FROM persistence WHERE key=?", (key,))
+
+    def list_persistence(self, states: tuple[str, ...] | None = None) -> list[dict]:
+        if not states:
+            return self._all("SELECT * FROM persistence ORDER BY source, name")
+        q = ",".join("?" * len(states))
+        return self._all(f"SELECT * FROM persistence WHERE state IN ({q}) ORDER BY first_seen DESC", states)
+
+    def put_persistence(self, key: str, **fields) -> None:
+        """Insert or update one start-up entry (fields: source, location, name, command, target,
+        state, backup, event_id; first_seen/last_seen are kept up to date here)."""
+        now = time.time()
+        old = self.get_persistence(key)
+        if old is None:
+            row = {"source": "", "location": "", "name": "", "command": "", "target": "", "state": "new",
+                   "backup": "", "event_id": 0, **fields}
+            self._con().execute(
+                "INSERT INTO persistence(key, source, location, name, command, target, first_seen, "
+                "last_seen, state, backup, event_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (key, row["source"], row["location"], row["name"], row["command"], row["target"], now, now,
+                 row["state"], row["backup"], int(row["event_id"])))
+            return
+        allowed = {"source", "location", "name", "command", "target", "state", "backup", "event_id"}
+        sets = [f"{k}=?" for k in fields if k in allowed]
+        args = [fields[k] for k in fields if k in allowed]
+        self._con().execute(f"UPDATE persistence SET {', '.join(sets + ['last_seen=?'])} WHERE key=?",
+                            (*args, now, key))
+
+    def delete_persistence(self, key: str) -> None:
+        self._con().execute("DELETE FROM persistence WHERE key=?", (key,))
+
+
+def _decode_event(r: dict) -> dict:
+    r["findings"] = json.loads(r["findings"] or "[]")
+    r["data"] = json.loads(r["data"] or "{}")
+    return r
 
 
 def _decode_result(r: dict) -> dict:

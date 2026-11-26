@@ -1,8 +1,11 @@
 """Microsoft Defender status, read only.
 
 TacoGuard never changes Defender or any Windows security setting. This module only READS:
-`Get-MpComputerStatus` (Defender's own status) and the AntiVirusProduct list Windows Security keeps
-in root/SecurityCenter2. Results are cached for 5 minutes.
+`Get-MpComputerStatus` (Defender's own status), the AntiVirusProduct list Windows Security keeps
+in root/SecurityCenter2 and (Phase 3) the Controlled folder access setting (EnableControlledFolderAccess,
+read from Defender's MSFT_MpPreference class: the same value Get-MpPreference shows, no admin rights
+needed). One PowerShell run; results are cached for 5 minutes. The status dict carries
+"cfa": {"state": off|on|audit|block_disk|audit_disk|unknown, "value": int|None, "message"}.
 
     get_status(force=False) -> dict    blocking (up to ~15 s the first time), never raises
     peek() -> dict | None              non-blocking: the cached status (refreshes it in the
@@ -52,8 +55,39 @@ try {
   $out.av = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct |
     ForEach-Object { [ordered]@{ displayName = $_.displayName; productState = $_.productState } })
 } catch { $out.av_error = $_.Exception.Message }
+try {
+  $p = Get-CimInstance -Namespace root/Microsoft/Windows/Defender -ClassName MSFT_MpPreference
+  $out.pref = [ordered]@{ EnableControlledFolderAccess = $p.EnableControlledFolderAccess }
+} catch { $out.pref_error = $_.Exception.Message }
 $out | ConvertTo-Json -Depth 4 -Compress
 """
+
+# Controlled folder access (Windows Security > Ransomware protection). Read only.
+CFA_STATES = {
+    0: ("off", "Controlled folder access is off."),
+    1: ("on", "Controlled folder access is on: Windows blocks programs it doesn't trust from changing "
+              "files in your protected folders."),
+    2: ("audit", "Controlled folder access is in audit mode: Windows only records programs that change "
+                 "your protected folders and doesn't block them."),
+    3: ("block_disk", "Controlled folder access blocks programs from writing straight to the disk, but "
+                      "doesn't protect your folders."),
+    4: ("audit_disk", "Controlled folder access only records programs that write straight to the disk."),
+}
+CFA_UNKNOWN = "TacoGuard could not read the Controlled folder access setting."
+
+
+def parse_cfa(raw: dict) -> dict:
+    """{"state", "value", "message"} from the script's "pref" part."""
+    pref = raw.get("pref") if isinstance(raw, dict) else None
+    value = pref.get("EnableControlledFolderAccess") if isinstance(pref, dict) else None
+    try:
+        value = int(value) if value is not None and not isinstance(value, bool) else None
+    except (TypeError, ValueError):
+        value = None
+    if value not in CFA_STATES:
+        return {"state": "unknown", "value": value, "message": CFA_UNKNOWN}
+    state, message = CFA_STATES[value]
+    return {"state": state, "value": value, "message": message}
 
 _lock = threading.Lock()
 _cache: dict | None = None
@@ -125,6 +159,7 @@ def parse_status(raw: dict) -> dict:
         "other_products": [], "checked": time.time(),
     }
     raw = raw if isinstance(raw, dict) else {}
+    out["cfa"] = parse_cfa(raw)
     av = raw.get("av") or []
     if isinstance(av, dict):
         av = [av]

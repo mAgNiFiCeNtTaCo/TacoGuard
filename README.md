@@ -42,8 +42,35 @@ and never uploads your files.
   It installs only after you click, checks it again, and goes back to the old version by itself
   if the new one doesn't start.
 
-Coming in later phases: watching new downloads and programs as they appear, plus ransomware and
-start-up watches (Phase 3); blocking known bad websites, a tray icon and a Game mode (Phase 4).
+
+### Real-time protection
+
+While TacoGuard runs, a small background checker (the "guard") watches as things happen:
+
+- **New and changed files** in Downloads (yours, and a `Downloads` folder at the top of any drive),
+  Desktop, Documents and your Startup folder are checked once they finish writing. Half-finished
+  downloads are left alone until the browser finishes them.
+- **Newly started programs** are checked once (unchanged programs are remembered). A program with a
+  strong "malware" result is **paused** (frozen, not closed) and the Protection tab asks what to
+  do: **Resume**, **End it** or **Quarantine**. A "suspicious" program is only reported.
+- **Ransomware decoys:** a few hidden, ordinary-looking files (a budget, a scan, a receipt) sit in
+  Documents, Desktop, Pictures and Downloads. Nobody has a reason to change them; ransomware
+  rewrites everything it finds. When one changes, or many files are scrambled at once, TacoGuard
+  pauses the programs that were writing heavily at that moment and asks you. A program you know
+  (a game, a download, a backup) just needs **Resume**. Decoys never go into OneDrive, and they are
+  removed when you switch this off.
+- **Start-up entries:** TacoGuard notes what starts with Windows (Run keys, Startup folders,
+  scheduled tasks, services and a few rarer places) and tells you about anything new, with the
+  program it starts checked. Entries in your own account can be undone (and put back) from the
+  page; system-wide ones need administrator rights, so the page says where Windows lets you change
+  them.
+- **Controlled folder access:** the Protection tab explains Windows Security's own ransomware
+  protection and opens it for you. TacoGuard only reads that setting, never changes it.
+
+TacoGuard never quarantines or deletes anything by itself: it pauses, reports and waits for you.
+Alerts also show as Windows notifications when notifications are switched on in Windows' settings.
+
+Coming in Phase 4: blocking known bad websites, a tray icon and a Game mode.
 
 ## Getting started
 
@@ -57,7 +84,9 @@ py -3.14 -m venv .venv
 ```
 
 `install` puts a copy of TacoGuard in `%LOCALAPPDATA%\Programs\TacoGuard` (no administrator
-rights, no service, nothing that starts with Windows) and, with `--shortcut`, a Start-menu entry.
+rights, no service) and, with `--shortcut`, a Start-menu entry. It also makes TacoGuard start
+quietly when you sign in (one entry in your account's Run key), so real-time protection is on
+whenever you are; switch that off in Settings.
 Self-update works only on this installed copy. Start it from the Start menu, or run
 `%LOCALAPPDATA%\Programs\TacoGuard\TacoGuard.pyw`.
 
@@ -77,8 +106,12 @@ python -m tacoguard selftest       check that this copy works
 
 ## What it uses on your PC
 
-- TacoGuard runs only while its page is open. While it runs it checks for updates at start and
-  every 4 hours (you can change or switch that off in Settings).
+- TacoGuard runs from when you sign in (or when you start it) until you press Quit. While it runs
+  it checks for updates at start and every 4 hours (you can change or switch that off in Settings).
+- Real-time protection idles at well under 1% of the processor (measured: 0.02%) and, together with
+  the page, about 115 MB of memory. Checking new programs leaves memory behind, so for a minute or
+  two after a busy moment it can use more; then the guard restarts itself (about two seconds) to
+  give it back.
 - A scan runs at low priority and reads the disk at a capped speed, so games and other programs
   stay smooth. While ClamAV is loaded (during scans, and for 10 minutes after) it uses 1 to 1.7 GB
   of memory (more when it checks more files at once); it closes by itself after that.

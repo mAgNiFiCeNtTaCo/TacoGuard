@@ -15,3 +15,4 @@ reports/fp-*.json
 
 # built release folders (published to GitHub, not kept in git)
 releases/
+.nodeterm/
