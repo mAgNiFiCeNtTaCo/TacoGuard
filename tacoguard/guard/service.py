@@ -11,6 +11,19 @@ persistence), writes a heartbeat with every part's state into the store's meta t
 changes (checked every 5 s) to switch parts on and off live. A part that crashes is logged
 (logs\\guard.log), shown as "error" and restarted after 60 s, at most 3 times an hour; it never
 takes the guard down.
+
+Phase 4 (contract in tacoguard/phase4.py):
+- a fifth part "web" (tacoguard/webblock/watch.py WebWatcher, settings.webblock_enabled);
+- "Pause protection": while phase4.protection_paused(store), every part is stopped (state "off",
+  "Paused until HH:MM") and started again when the time passes or protection is resumed; files
+  changed meanwhile in the watched folders are then caught up;
+- Game mode: no notifications (toasts) while phase4.game_mode(store)["active"]; the events are
+  still written and the page shows them;
+- self-protection (tacoguard/selfprotect.py): main() hardens the process (settings.self_protection),
+  and every 60 s OwnWatch looks at TacoGuard's own Run value and data folder ACL;
+- the page process ending WITHOUT the stop file (it crashed or another program ended it): the guard
+  of the INSTALLED copy starts the launcher again (--background) before it exits, at most once per
+  10 minutes, and records an event kind "self".
 """
 from __future__ import annotations
 
@@ -39,9 +52,21 @@ MEMORY_LIMIT = 512 * 1024**2
 ERROR_ALREADY_EXISTS = 183
 EXIT_ALREADY_RUNNING = 3
 EXIT_RECYCLE = 75          # "start me again now": not a crash (see Guard._maybe_recycle)
-PART_NAMES = ("folders", "processes", "ransomware", "persistence")
+PART_NAMES = ("folders", "processes", "ransomware", "persistence", "web")
 MISSING_PART_MSG = "This part is not included in this copy of TacoGuard, so it is not running."
 OFF_MSG = "Turned off in Settings."
+PAGE_RESTART_KEY = "page_restarted_at"
+PAGE_RESTARTED_TITLE = "TacoGuard's page process was ended unexpectedly and was started again"
+PAGE_NOT_RESTARTED_TITLE = "TacoGuard's page process was ended unexpectedly"
+
+
+def paused_message(until: float, now: float | None = None) -> str:
+    """"Paused until 14:30" ("... tomorrow" when that is another day)."""
+    t = time.localtime(until)
+    words = f"Paused until {time.strftime('%H:%M', t)}"
+    if time.strftime("%Y%m%d", t) != time.strftime("%Y%m%d", time.localtime(now)):
+        words += " tomorrow"
+    return words + "."
 
 
 def part_dict(state: str, message: str = "", watched=None, checked: int = 0) -> dict:
@@ -85,6 +110,11 @@ def _make_persistence(g: "Guard"):
         return PersistenceWatcher(g.settings, g.store, g.checker)
 
 
+def _make_web(g: "Guard"):
+    from ..webblock.watch import WebWatcher       # Phase 4 (Helper M); missing -> "not included"
+    return WebWatcher(g.settings, g.store, g.checker)
+
+
 def _list_key(value) -> tuple:
     return tuple(winpath.norm_key(str(v)) for v in (value or []))
 
@@ -96,6 +126,7 @@ PART_SPECS = {
     "ransomware": (_make_ransomware, lambda s: bool(s.ransomware_guard),
                    lambda s: _list_key(s.canary_folders)),
     "persistence": (_make_persistence, lambda s: bool(s.persistence_watch), lambda s: ()),
+    "web": (_make_web, lambda s: bool(getattr(s, "webblock_enabled", False)), lambda s: ()),
 }
 
 
@@ -133,6 +164,9 @@ class Guard:
     RECYCLE_LOOK_S = 60.0
     CATCH_UP_LIMIT = 500
     CATCH_UP_MAX_AGE_S = 7 * 86400
+    PAUSE_CHECK_S = 2.0                # "Pause protection" (phase4.protection_paused)
+    OWN_CHECK_S = 60.0                 # selfprotect.OwnWatch: Run value, data folder ACL
+    PAGE_RESTART_GAP_S = 10 * 60       # the page is started again at most this often
 
     def __init__(self, settings, store, detectors=None, hub=None):
         self.settings, self.store = settings, store
@@ -167,6 +201,15 @@ class Guard:
         self._last_event_id = 0
         self._log_handler = None
         self._running = False
+        # Phase 4
+        self.paused_until = 0.0            # protection paused until (epoch); 0 = not paused
+        self._paused_since = 0.0
+        self.own_watch = None              # selfprotect.OwnWatch (made in start() when self_protection)
+        self.own_watch_factory = None      # tests: callable(guard) -> object with check()
+        self.page_launcher = None          # main(): callable() that starts the installed page again
+        self.update_busy_fn = None         # main(): callable() -> True while a self-update runs
+        self.page_lost = False             # the page process ended without the stop file
+        self.hardened = None               # main(): what selfprotect.maybe_harden() said
 
     # ---- paths ----------------------------------------------------------------------------
     @property
@@ -209,10 +252,17 @@ class Guard:
             except Exception:
                 self._parent_ctime = None
                 self.request_stop("the page process was not running")
+        self.paused_until = self._read_pause()
+        if self.paused_until:
+            # files changed while protection was paused (and the guard down) are caught up on resume
+            self._paused_since = self.last_heartbeat_before or time.time()
+            log.info("Protection is paused until %s", time.strftime("%H:%M", time.localtime(self.paused_until)))
         self._apply_parts(initial=True)
         self._remove_leftover_decoys()
+        self._make_own_watch()
         self._write_heartbeat()
-        self._start_catch_up()
+        if not self.paused_until:
+            self._start_catch_up()
         self._thread = threading.Thread(target=self._control_loop, name="tacoguard-guard", daemon=True)
         self._thread.start()
 
@@ -321,19 +371,27 @@ class Guard:
     # ---- parts ------------------------------------------------------------------------------
     def _apply_parts(self, initial: bool = False) -> None:
         now = time.monotonic()
+        paused = paused_message(self.paused_until) if self.paused_until else ""
         for name, (make, enabled, key_of) in PART_SPECS.items():
-            p = self.parts[name]
+            p = self.parts.get(name)
+            if p is None:
+                p = self.parts[name] = _Part(name)
             want = bool(self.settings.realtime_enabled) and enabled(self.settings)
             try:
                 key = key_of(self.settings)
             except Exception:
                 key = ()
             if not want:
-                if p.inst is not None or p.state != "off":
+                if p.inst is not None or p.state != "off" or p.message != OFF_MSG:
                     was_on = p.inst is not None
                     self._stop_part(p, "off", OFF_MSG)
                     if name == "ransomware" and was_on and not initial and not self.settings.ransomware_guard:
                         self._remove_decoys(make)
+                continue
+            if paused:
+                # "Pause protection": the part does not check or pause anything until resumed
+                if p.inst is not None or p.state != "off" or p.message != paused:
+                    self._stop_part(p, "off", paused)
                 continue
             if p.inst is not None and key != p.key:
                 log.info("Settings for %s changed: restarting it", name)
@@ -427,6 +485,122 @@ class Guard:
                 except Exception:
                     pass
                 self._part_crashed(p, None, st["message"])
+
+    # ---- Phase 4: pause, own watch, page restart ------------------------------------------------
+    def _read_pause(self) -> float:
+        try:
+            from ..phase4 import protection_paused
+            return float(protection_paused(self.store) or 0.0)
+        except Exception:
+            return 0.0
+
+    def _check_pause(self) -> None:
+        """Stops the parts while protection is paused; starts them again when it ends."""
+        until = self._read_pause()
+        if until == self.paused_until:
+            return
+        was = self.paused_until
+        self.paused_until = until
+        if until and not was:
+            self._paused_since = time.time()
+            log.info("Protection paused until %s", time.strftime("%H:%M", time.localtime(until)))
+        elif not until:
+            log.info("Protection resumed")
+        self._apply_parts()
+        if not until and was:
+            since, self._paused_since = self._paused_since, 0.0
+            self._start_catch_up(since)
+        self._write_heartbeat()
+
+    def _make_own_watch(self) -> None:
+        self.own_watch = None
+        if not getattr(self.settings, "self_protection", False):
+            return
+        try:
+            if self.own_watch_factory is not None:
+                self.own_watch = self.own_watch_factory(self)
+            else:
+                from ..selfprotect import OwnWatch
+                self.own_watch = OwnWatch(self.settings, self.store)
+        except Exception:
+            log.exception("The watch over TacoGuard's own files could not start")
+            self.own_watch = None
+
+    def _check_own(self) -> None:
+        if self.hardened:
+            # threads started by native code (not through Python's threading) since the last look
+            try:
+                from ..selfprotect import harden_threads
+                harden_threads()
+            except Exception:
+                log.exception("Hardening the guard's threads failed")
+        if self.own_watch is None or not getattr(self.settings, "self_protection", False):
+            return
+        try:
+            self.own_watch.check()
+        except Exception:
+            log.exception("The watch over TacoGuard's own files failed")
+
+    def restart_page_if_needed(self, launcher=None) -> bool:
+        """After the guard stopped because its page process ended WITHOUT the stop file: start
+        the installed page again (self.page_launcher, set by main() only for the installed copy),
+        at most once per PAGE_RESTART_GAP_S, and record an event kind "self". True when the page
+        was started. Not while Windows shuts down or a self-update is under way."""
+        launcher = launcher or self.page_launcher
+        if not self.page_lost or launcher is None:
+            return False
+        self.page_lost = False
+        try:
+            from ..selfprotect import windows_shutting_down
+            if windows_shutting_down():
+                log.info("The page ended while Windows shuts down: not starting it again")
+                return False
+        except Exception:
+            pass
+        try:
+            if self.update_busy_fn is not None and self.update_busy_fn():
+                log.info("The page ended during a self-update: the update starts it again")
+                return False
+        except Exception:
+            pass
+        now = time.time()
+        try:
+            last = float(self.store.get_meta(PAGE_RESTART_KEY) or 0)
+        except Exception:
+            last = 0.0
+        if 0 <= now - last < self.PAGE_RESTART_GAP_S:
+            log.warning("The page process ended unexpectedly again within %d minutes: not starting it again",
+                        self.PAGE_RESTART_GAP_S // 60)
+            self._self_event(PAGE_NOT_RESTARTED_TITLE,
+                             "TacoGuard's page process ended again within a few minutes, so TacoGuard did not "
+                             "start it again by itself (real-time protection is off until it runs). Start "
+                             "TacoGuard from the Start menu. To close TacoGuard on purpose, use Quit in the "
+                             "page or the tray icon.")
+            return False
+        try:
+            self.store.set_meta(PAGE_RESTART_KEY, str(now))
+        except Exception:
+            pass
+        try:
+            launcher()
+        except Exception as e:
+            log.error("Could not start the page again", exc_info=(type(e), e, e.__traceback__))
+            self._self_event(PAGE_NOT_RESTARTED_TITLE,
+                             "TacoGuard's page process was ended by something other than Quit, and TacoGuard "
+                             f"could not start it again ({plain_error(e)}). Start TacoGuard from the Start menu.")
+            return False
+        log.warning("The page process ended without Quit: started it again")
+        self._self_event(PAGE_RESTARTED_TITLE,
+                         "TacoGuard's page process ended without Quit (it crashed, or another program ended it), "
+                         "so TacoGuard started it again. If this happens often, run a full scan. To close "
+                         "TacoGuard on purpose, use Quit in the page or the tray icon.")
+        return True
+
+    def _self_event(self, title: str, message: str) -> None:
+        try:
+            self.store.add_guard_event("self", "warning", title, message)
+        except Exception:
+            log.exception("Could not record an event")
 
     def _remove_leftover_decoys(self) -> None:
         """At start: the ransomware guard is off but decoy files are still listed (it was switched
@@ -527,7 +701,8 @@ class Guard:
 
     def _control_loop(self) -> None:
         last = {"hb": time.monotonic(), "settings": time.monotonic(), "parent": 0.0,
-                "detectors": time.monotonic(), "notify": time.monotonic()}
+                "detectors": time.monotonic(), "notify": time.monotonic(), "pause": 0.0,
+                "own": time.monotonic()}
 
         def due(name: str, every: float) -> bool:
             now = time.monotonic()
@@ -542,12 +717,19 @@ class Guard:
                     self.request_stop("a stop was asked for")
                     break
                 if due("parent", self.PARENT_CHECK_S) and self._parent_gone():
+                    # Quit writes the stop file before the page closes: without it, the page
+                    # crashed or another program ended it (restart_page_if_needed, after stop)
+                    self.page_lost = not self.stop_file.exists()
                     self.request_stop("the page process ended")
                     break
                 if due("settings", self.SETTINGS_CHECK_S):
                     self._maybe_reload_settings()
                     if self._stop_evt.is_set():
                         break
+                if due("pause", self.PAUSE_CHECK_S):
+                    self._check_pause()
+                if due("own", self.OWN_CHECK_S):
+                    self._check_own()
                 self._check_parts_health()
                 self._apply_parts()            # restarts parts whose retry time came
                 if due("detectors", self.DETECTOR_CHECK_S):
@@ -630,8 +812,17 @@ class Guard:
             events = self.store.list_guard_events(after_id=self._last_event_id, limit=50)
         except Exception:
             return
+        if not events:
+            return
+        try:
+            from ..phase4 import game_mode
+            quiet = bool(game_mode(self.store).get("active"))
+        except Exception:
+            quiet = False
         for ev in sorted(events, key=lambda e: e["id"]):
             self._last_event_id = max(self._last_event_id, ev["id"])
+            if quiet:
+                continue                    # Game mode: no toasts; the page and tray still show it
             if ev["level"] in ("malware", "suspicious", "warning"):
                 self._ensure_notify_thread()
                 try:
@@ -667,8 +858,10 @@ class Guard:
         self._notify_thread = None
 
     # ---- catch-up at start -------------------------------------------------------------------
-    def _start_catch_up(self) -> None:
-        since = self.last_heartbeat_before
+    def _start_catch_up(self, since: float | None = None) -> None:
+        since = self.last_heartbeat_before if since is None else since
+        if self._catchup is not None and self._catchup.is_alive():
+            return
         part = self.parts["folders"].inst
         if not since or part is None:
             return                              # first start ever, or the folder part is off
@@ -717,6 +910,34 @@ def take_mutex(name: str) -> bool:
     return True
 
 
+def release_mutex() -> None:
+    """Lets a new guard start before this process has fully exited (the page restart)."""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    while _mutex:
+        try:
+            k32.CloseHandle(_mutex.pop())
+        except Exception:
+            pass
+
+
+def page_launcher_for(settings):
+    """The page restart for main(): only the guard of the INSTALLED copy, never while pytest
+    runs. None otherwise."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    try:
+        from ..selfupdate import running_from_install
+        if not running_from_install():
+            return None
+        from ..config import install_root
+        from ..selfprotect import launch_page
+    except Exception:
+        return None
+    root, data = install_root(), str(settings.data_dir)
+    return lambda: launch_page(root, data)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="tacoguard.guard")
     ap.add_argument("--data", default=None)
@@ -733,10 +954,22 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ALREADY_RUNNING
     lower_priority("below_normal")
     limit_memory(MEMORY_LIMIT)
+    try:
+        from ..selfprotect import maybe_harden      # only admins may end / change this process
+        hardened = maybe_harden(settings, log)
+    except Exception:
+        hardened = False
     store = Store(settings.db_path)
     guard = Guard(settings, store)
+    guard.hardened = hardened
     guard.parent_pid = args.parent or None
     guard.recycle_enabled = bool(args.parent)      # only when a page process will start it again
+    if args.parent:
+        guard.page_launcher = page_launcher_for(settings)
+        if guard.page_launcher is not None:
+            from ..config import install_root
+            from ..selfupdate import _busy
+            guard.update_busy_fn = lambda: _busy(install_root())
     try:
         from . import notify as _notify        # a Windows notification for each new event
 
@@ -760,6 +993,8 @@ def main(argv: list[str] | None = None) -> int:
     code = 0
     try:
         guard.start()
+        if guard.hardened:
+            log.info("Self-protection is on: only administrators can end or change this process")
         while not guard.wait(0.5):      # short waits so signals are handled promptly
             pass
     except Exception:
@@ -771,6 +1006,15 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             log.exception("The guard did not stop cleanly")
             code = code or 1
+        if guard.page_lost and guard.page_launcher is not None:
+            release_mutex()             # the new page's guard may start at once
+            guard._setup_log()          # stop() closed guard.log
+            try:
+                guard.restart_page_if_needed()
+            except Exception:
+                log.exception("Could not start the page again")
+            finally:
+                guard._close_log()
         store.close()
     if code == 0 and guard.recycle:
         return EXIT_RECYCLE

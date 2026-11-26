@@ -38,12 +38,13 @@ ENGINE_NAMES = {
     "clamav": "ClamAV signature",
     "yara": "YARA rule",
     "ml": "machine-learning check",
+    "lookup": "MalwareBazaar lookup",      # Phase 4: tacoguard/lookup.py, exact-file match
 }
 
 
 @dataclass
 class Finding:
-    engine: str                 # "hash" | "clamav" | "yara"
+    engine: str                 # "hash" | "clamav" | "yara" | "ml" | "lookup"
     rule: str                   # signature / rule name, exactly as the source names it
     confidence: Confidence
     source: str                 # who wrote it, e.g. "ClamAV official signatures (Cisco Talos)",
@@ -126,7 +127,7 @@ def describe_finding(f: Finding) -> str:
 
 # ---- digital signatures (the scan engine's signed-program rule uses these words) -------------
 SIGNED_PHRASE = "because the file has a valid digital signature from"
-_SHORT_ENGINE = {"clamav": "ClamAV", "yara": "YARA rule", "hash": "known-bad list"}
+_SHORT_ENGINE = {"clamav": "ClamAV", "yara": "YARA rule", "hash": "known-bad list", "lookup": "MalwareBazaar"}
 
 
 def _short_finding(f: Finding) -> str:

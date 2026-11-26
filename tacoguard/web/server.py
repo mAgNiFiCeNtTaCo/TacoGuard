@@ -22,6 +22,16 @@ Phase 3: the page process starts and watches the guard process (GuardSupervisor,
 asks: never in tests unless a test sets it up on purpose with a fake command), and the Protection
 tab: /api/protection plus the user's actions on guard events, paused programs and start-up
 entries (the guard never acts on files itself; the page does what the user clicked).
+
+Phase 4 (contract: tacoguard/phase4.py): the Home dashboard (/api/dashboard), pausing protection
+and Game mode (/api/protection/pause, /api/gamemode; gamemode.py decides automatic Game mode),
+website blocking (/api/webblock: list status, refresh, the hosts file through Windows' admin
+prompt on a background thread, one at a time), the abuse.ch key (/api/secrets/abusech: the answer
+says only whether a key is set and its last 4 characters; the key is never echoed or logged) and
+MalwareBazaar lookups of flagged files (/api/lookup). The tray icon (tray.py) runs in this process
+when serve() starts it and settings.tray_enabled. Other helpers' Phase 4 modules (webblock,
+lookup, secrets, selfprotect) are imported when first used: a missing one gives a calm "not part
+of this copy yet" on the page.
 """
 from __future__ import annotations
 
@@ -51,7 +61,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .. import APP_NAME, __version__, allowlist, autostart, defender, detect, learning, quarantine, setup_fetch, winpath
+from .. import (APP_NAME, __version__, allowlist, autostart, defender, detect, gamemode, learning, phase4,
+                quarantine, setup_fetch, winpath)
 from ..config import CLAMAV_THREADS_MAX, ENDPOINTS, clamav_thread_count, install_root, load_settings
 from ..guard import procctl
 from ..model import ENGINE_NAMES, MALWARE, SUSPICIOUS, Confidence, Finding, plain_error
@@ -124,7 +135,7 @@ PROJECT_FOLDER_NOTE = ("This copy of TacoGuard runs from its project folder, so 
 REJECTED_MSG = ("An update was refused because it didn't pass TacoGuard's checks (its signature, its "
                 "checksum or a test run). TacoGuard kept the last good set.")
 UPDATE_COMPONENTS = (("clamav_signatures", "ClamAV signatures"), ("yara_rules", "YARA rules"),
-                     ("ml_model", "ML model"), ("app", "TacoGuard app"))
+                     ("ml_model", "ML model"), ("web_lists", "Website lists"), ("app", "TacoGuard app"))
 REJECTED_STATES = ("rejected",)      # "expired" (an out-of-date signed list) is calm: no banner
 OFFER_TTL_S = 60
 _VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$")
@@ -173,9 +184,12 @@ GUARD_HUNG_S = 90                    # our guard runs but wrote no heartbeat for
 GUARD_POLL_S = 2.0                   # how often the page looks whether its guard still runs
 PROTECTION_EVENTS = 100
 GUARD_NOT_READY = "Real-time protection isn't part of this copy of TacoGuard yet."
+STILL_CLOSING_MSG = ("Real-time protection is still closing. If it doesn't, restart Windows or end it from "
+                     "Task Manager as administrator.")
 PERSISTENCE_NOT_READY = "Start-up entry actions aren't available in this copy of TacoGuard yet."
 PART_LABELS = (("folders", "New and changed files"), ("processes", "Newly started programs"),
                ("ransomware", "Ransomware decoys"), ("persistence", "Start-up entries"))
+WEB_PART = ("web", "Bad websites")      # Phase 4 (webblock/watch.py), when the guard has it
 CFA_ON_NOTE = ("Controlled folder access is on, so Windows may block TacoGuard from making its decoy files "
                "in protected folders such as Documents and Pictures. If Windows Security says it blocked "
                "pythonw.exe or python.exe, you can allow it there (Ransomware protection > Allow an app "
@@ -190,6 +204,80 @@ def _load_persistence():
 def _load_guard_folders():
     from ..guard import folders
     return folders
+
+
+# ---- Phase 4: web blocking, lookups, tray, Game mode, self-protection (contract: phase4.py) ------
+PHASE4_SWITCHES = {
+    "webblock_enabled": "'Website blocking'",
+    "webblock_phishing_list": "'Phishing website list'",
+    "webblock_urlhaus_list": "'URLhaus malware website list'",
+    "webblock_hosts": "'Block in every browser (hosts file)'",
+    "lookup_enabled": "'MalwareBazaar lookups'",
+    "tray_enabled": "'TacoGuard icon in the taskbar'",
+    "game_mode_auto": "'Game mode by itself'",
+    "self_protection": "'Self-protection'",
+}
+HOSTS_EVERY_DAYS = (1, 30, "TacoGuard can offer a hosts file update every 1 to 30 days.")
+WEB_ALLOW_MAX = 500
+HOSTS_REMOVE_OFFER = ("TacoGuard's block is still in Windows' hosts file. Take it out with 'Remove "
+                      "TacoGuard's block' (one administrator prompt), or it keeps blocking those sites.")
+PAUSE_MAX_MIN = 24 * 60
+WEBBLOCK_NOT_READY = "Website blocking isn't part of this copy of TacoGuard yet."
+HOSTS_NOT_READY = "Blocking in the hosts file isn't part of this copy of TacoGuard yet."
+LOOKUP_NOT_READY = "MalwareBazaar lookups aren't part of this copy of TacoGuard yet."
+SECRETS_NOT_READY = "Saving an abuse.ch key isn't part of this copy of TacoGuard yet."
+KEY_BAD_MSG = ("That doesn't look like an abuse.ch key. Copy the Auth-Key from your account page on "
+               "auth.abuse.ch and paste it again.")
+KEY_SAVE_FAILED = "Windows could not save the key safely, so it was not saved. Try again."
+ABUSECH = "abusech"
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+FLAGGED_LEVELS = (MALWARE, SUSPICIOUS)
+SECRET_PATH_PREFIX = "/api/secrets/"
+HOSTS_ACTIONS = {"apply": "apply_elevated", "remove": "remove_elevated"}
+
+
+def _load_webblock_lists():
+    from ..webblock import lists
+    return lists
+
+
+def _load_webblock_hosts():
+    from ..webblock import hosts
+    return hosts
+
+
+def _load_lookup():
+    from .. import lookup
+    return lookup
+
+
+def _load_secrets():
+    from .. import secrets as tg_secrets      # TacoGuard's own key store, not Python's `secrets`
+    return tg_secrets
+
+
+def _load_selfprotect():
+    from .. import selfprotect
+    return selfprotect
+
+
+def _load_tray():
+    from .. import tray
+    return tray
+
+
+def _simple(value, depth: int = 0):
+    """A copy of another module's status answer with only plain values (str, numbers, bools,
+    short lists, small dicts), so nothing odd reaches the page."""
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    if isinstance(value, str):
+        return value[:2000]
+    if depth < 3 and isinstance(value, (list, tuple)):
+        return [_simple(v, depth + 1) for v in list(value)[:50]]
+    if depth < 3 and isinstance(value, dict):
+        return {str(k)[:100]: _simple(v, depth + 1) for k, v in list(value.items())[:50]}
+    return str(value)[:200]
 
 
 def guard_command(settings, parent_pid: int) -> list[str] | None:
@@ -289,6 +377,7 @@ class GuardSupervisor:
         self.next_start = 0.0
         self.starts = 0
         self.message = ""
+        self.stop_note = ""                   # an adopted guard that could not be ended (STILL_CLOSING_MSG)
         self._lock = threading.RLock()
         self._wake = threading.Event()
         self._closing = False
@@ -342,10 +431,13 @@ class GuardSupervisor:
             if not self.settings.realtime_enabled:
                 if self._running():
                     self._stop_guard()
+                elif self.stop_note and not _guard_process(read_guard_state(self.app.store).get("pid") or 0):
+                    self.stop_note = ""           # the guard that was still closing has gone
                 self.crashes.clear()
                 self.gave_up = self.unavailable = False
                 self.message, self.next_start = "", 0.0
                 return
+            self.stop_note = ""
             if self.adopted is not None:
                 if self._adopted_alive():
                     return
@@ -484,10 +576,14 @@ class GuardSupervisor:
                 try:
                     adopted.wait(self.stop_wait)
                 except Exception:
+                    # A guard this page didn't start is protected by self-protection: Windows refuses
+                    # to end it without admin rights. One try, never a loop; then a plain note.
                     try:
                         adopted.kill()
                     except Exception:
-                        pass
+                        self.app.log.info("the adopted guard (pid %s) did not stop within %s s and could "
+                                          "not be ended", getattr(adopted, "pid", "?"), self.stop_wait)
+                        self.stop_note = STILL_CLOSING_MSG
         finally:
             try:
                 stop.unlink(missing_ok=True)
@@ -938,6 +1034,17 @@ class App:
         self.manage_guard = False
         self.guard = GuardSupervisor(self)
         self.autostart_key: str | None = None   # tests: a key under HKCU\Software\TacoGuardTest
+        # Phase 4: tray icon and automatic Game mode (started only by serve()), web blocking actions
+        self.manage_tray = False
+        self.tray = None
+        self.tray_note = ""
+        self.gamemode = gamemode.GameModeWatcher(settings, self.store, log=self.log)
+        self.manage_gamemode = False
+        self.hardened: bool | None = None       # self-protection result in this process (None = not tried)
+        self.web_lock = threading.Lock()
+        self.hosts_action = {"running": False, "what": "", "message": "", "error": "", "started": 0.0,
+                             "finished": 0.0, "ok": False}
+        self.lists_action = {"running": False, "message": "", "error": "", "started": 0.0, "finished": 0.0}
 
     def _make_logger(self) -> logging.Logger:
         log = logging.getLogger(f"tacoguard.web.{id(self)}")
@@ -954,6 +1061,11 @@ class App:
         return log
 
     def close(self) -> None:
+        self.stop_tray()
+        try:
+            self.gamemode.stop()
+        except Exception:
+            self.log.error("stopping Game mode detection failed\n%s", traceback.format_exc())
         try:
             self.guard.close()
         except Exception:
@@ -1368,8 +1480,9 @@ class App:
         alive = bool(st.get("pid")) and time.time() - hb < GUARD_FRESH_S and _pid_exists(st.get("pid"))
         raw_parts = st.get("parts") if isinstance(st.get("parts"), dict) else {}
         parts = []
+        labels = PART_LABELS + ((WEB_PART,) if isinstance(raw_parts.get(WEB_PART[0]), dict) else ())
         if alive:
-            for name, label in PART_LABELS:
+            for name, label in labels:
                 p = raw_parts.get(name) if isinstance(raw_parts.get(name), dict) else {}
                 watched = [w for w in (p.get("watched") or []) if isinstance(w, str)][:200]
                 try:
@@ -1382,7 +1495,7 @@ class App:
         note = sup.message
         if not s.realtime_enabled:
             state, summary, note = "off", ("Real-time protection is off (you can turn it on in Settings). "
-                                           "TacoGuard still checks files when you scan them."), ""
+                                           "TacoGuard still checks files when you scan them."), sup.stop_note
         elif sup.gave_up:
             state, summary, note = "error", sup.message, ""
         elif alive:
@@ -1398,6 +1511,8 @@ class App:
                 bits.append(f"decoys in {n} folder{'s' if n != 1 else ''}" if n else "decoy files")
             if "persistence" in on:
                 bits.append("start-up entries")
+            if WEB_PART[0] in on:
+                bits.append("bad websites")
             summary = ("Real-time protection is on: " + ", ".join(bits) + "." if bits else
                        "Real-time protection is running, but each of its parts is switched off in Settings.")
             state = "warn" if any(p["state"] == "error" for p in parts) else "on"
@@ -1414,7 +1529,8 @@ class App:
         return {"enabled": bool(s.realtime_enabled), "alive": alive, "state": state, "summary": summary,
                 "note": note, "parts": parts, "started": st.get("started") or 0,
                 "heartbeat": hb, "version": str(st.get("version") or ""),
-                "managed": self.manage_guard, "gave_up": sup.gave_up}
+                "managed": self.manage_guard, "gave_up": sup.gave_up,
+                "paused_until": phase4.protection_paused(self.store)}
 
     def _event_brief(self, event_id, cache: dict) -> dict | None:
         if not event_id:
@@ -1427,7 +1543,8 @@ class App:
     def protection_view(self) -> dict:
         """Everything the Protection tab shows. Programs paused by the guard that have closed in
         the meantime are marked "gone" here (their event stays, with the file actions)."""
-        events = [_event_for_page(e) for e in self.store.list_guard_events(limit=PROTECTION_EVENTS)]
+        events = self.with_lookups([_event_for_page(e)
+                                    for e in self.store.list_guard_events(limit=PROTECTION_EVENTS)])
         cache = {e["id"]: e for e in events}
         paused = []
         for row in self.store.list_paused(("paused",)):
@@ -1444,8 +1561,8 @@ class App:
                   for r in self.store.list_persistence(("undone",))]
         linked = {p["event_id"] for p in paused if p["event_id"]} | \
                  {r["event_id"] for r in startup if r.get("event_id")}
-        attention = [_event_for_page(e) for e in self.store.list_guard_events(("new",), limit=200)
-                     if e["id"] not in linked]
+        attention = self.with_lookups([_event_for_page(e) for e in self.store.list_guard_events(("new",), limit=200)
+                                       if e["id"] not in linked])
         levels = [e["level"] for e in attention] + [(p["event"] or {}).get("level") for p in paused]
         return {
             "guard": self.guard_view(), "events": events, "paused": paused, "startup": startup,
@@ -1550,6 +1667,400 @@ class App:
                 out.append(disp)
         return out
 
+    # ---- Phase 4: quit, open, pause, Game mode, tray, self-protection ---------------------------
+    def quit(self) -> None:
+        """The page's Stop button and the tray's Quit: the server stops, then serve() closes the
+        rest (guard, updates, tray, Game mode) through close()."""
+        srv = self.server
+        if srv is not None:
+            threading.Thread(target=srv.shutdown, name="tacoguard-quit", daemon=True).start()
+
+    def open_page(self) -> None:
+        webbrowser.open(f"http://127.0.0.1:{self.port}/")
+
+    def pause_protection(self, seconds: float) -> float:
+        until = phase4.pause_protection(self.store, seconds)
+        self.log.info("real-time protection paused until %s",
+                      time.strftime("%Y-%m-%d %H:%M", time.localtime(until)))
+        self.refresh_tray()
+        return until
+
+    def resume_protection(self) -> None:
+        phase4.resume_protection(self.store)
+        self.log.info("real-time protection resumed")
+        self.refresh_tray()
+
+    def switch_game_mode(self, on: bool) -> dict:
+        gm = self.gamemode.user_switch(bool(on))
+        self.log.info("Game mode switched %s by you", "on" if on else "off")
+        self.refresh_tray()
+        return gm
+
+    def start_gamemode(self) -> None:
+        """serve() only: automatic Game mode looks at the screen every 10 s from now on."""
+        self.manage_gamemode = True
+        self.gamemode.start()
+
+    def start_tray(self) -> None:
+        """serve() only: the icon in the notification area (settings.tray_enabled)."""
+        self.manage_tray = True
+        self.apply_tray()
+
+    def apply_tray(self) -> str:
+        """settings.tray_enabled changed (or serve() started): add or take away the icon. Returns a
+        plain sentence when something went wrong, else ""."""
+        if not self.manage_tray:
+            return ""
+        if not self.settings.tray_enabled:
+            self.stop_tray()
+            self.tray_note = ""
+            return ""
+        if self.tray is not None and self.tray.running:
+            return ""
+        mod = self._optional(_load_tray)
+        if mod is None:
+            return ""
+        ok = False
+        try:
+            self.tray = mod.Tray(self)
+            ok = self.tray.start()
+        except Exception:
+            self.log.error("the tray icon failed to start\n%s", traceback.format_exc())
+        self.tray_note = "" if ok else ("The TacoGuard icon could not be added to the taskbar. Details are "
+                                        "in the log.")
+        return self.tray_note
+
+    def stop_tray(self) -> None:
+        t, self.tray = self.tray, None
+        if t is not None:
+            try:
+                t.stop()
+            except Exception:
+                self.log.error("stopping the tray icon failed\n%s", traceback.format_exc())
+
+    def refresh_tray(self) -> None:
+        """Show a change on the icon now instead of at its next 5-second look."""
+        t = self.tray
+        if t is not None and t.running:
+            try:
+                t.refresh()
+            except Exception:
+                self.log.error("tray refresh failed\n%s", traceback.format_exc())
+
+    def harden(self) -> bool:
+        """serve() only: self-protection for this process (selfprotect.maybe_harden: only when
+        settings.self_protection, never under pytest)."""
+        mod = self._optional(_load_selfprotect)
+        fn = getattr(mod, "maybe_harden", None) if mod is not None else None
+        if not callable(fn):
+            return False
+        self.hardened = bool(fn(self.settings, self.log))
+        return self.hardened
+
+    def modes_view(self) -> dict:
+        """Cheap (two store reads): paused protection and Game mode, for the banner on every tab."""
+        gm = phase4.game_mode(self.store)
+        return {"paused_until": phase4.protection_paused(self.store),
+                "game_mode": dict(gm, auto=bool(self.settings.game_mode_auto)),
+                "lookup_ready": self.lookup_ready()}
+
+    def selfprotect_view(self) -> dict:
+        out = {"enabled": bool(self.settings.self_protection),
+               "available": self._optional(_load_selfprotect) is not None,
+               "hardened": self.hardened, "notes": []}
+        notes: list[str] = []
+
+        def take(items) -> None:
+            if isinstance(items, (list, tuple)):
+                notes.extend(n.strip() for n in items if isinstance(n, str) and n.strip())
+        take(read_guard_state(self.store).get("notes"))
+        try:
+            raw = json.loads(self.store.get_meta("selfprotect") or "{}")
+        except (ValueError, TypeError):
+            raw = {}
+        if isinstance(raw, dict):
+            for key in ("notes", "problems", "messages", "alerts"):
+                take(raw.get(key))
+            if isinstance(raw.get("message"), str) and raw["message"].strip():
+                notes.append(raw["message"].strip())
+        seen: set[str] = set()
+        out["notes"] = [n[:500] for n in notes if not (n in seen or seen.add(n))][:10]
+        return out
+
+    # ---- Phase 4: the abuse.ch key and MalwareBazaar lookups -----------------------------------------
+    def key_view(self) -> dict:
+        """Whether an abuse.ch key is saved, and its last 4 characters. Never the key."""
+        sec = self._optional(_load_secrets)
+        if sec is None:
+            return {"available": False, "set": False, "hint": "", "message": SECRETS_NOT_READY}
+        try:
+            is_set = bool(sec.has_key(self.settings, ABUSECH))
+            hint = str(sec.key_hint(self.settings, ABUSECH) or "") if is_set else ""
+        except Exception as e:
+            self.log.error("reading the abuse.ch key status failed (%s)", type(e).__name__)
+            is_set, hint = False, ""
+        msg = ""
+        if is_set and not hint:
+            msg = ("A key is saved, but TacoGuard can't read it (it may have been saved by another Windows "
+                   "account). Paste your key again.")
+        return {"available": True, "set": is_set, "hint": hint, "message": msg}
+
+    def lookup_ready(self) -> bool:
+        mod = self._optional(_load_lookup)
+        if not self.settings.lookup_enabled or mod is None:
+            return False
+        if callable(getattr(mod, "ready", None)):
+            try:
+                return bool(mod.ready(self.settings))
+            except Exception:
+                return False
+        sec = self._optional(_load_secrets)
+        try:
+            return bool(sec is not None and sec.has_key(self.settings, ABUSECH))
+        except Exception:
+            return False
+
+    def lookup_view(self) -> dict:
+        mod = self._optional(_load_lookup)
+        key = self.key_view()
+        out = {"enabled": bool(self.settings.lookup_enabled), "available": mod is not None, "key": key,
+               "ready": False, "state": "", "message": "", "when": 0.0, "last_error": "", "left": None}
+        if mod is None:
+            out["message"] = LOOKUP_NOT_READY
+            return out
+        out["ready"] = out["enabled"] and key["set"]
+        try:
+            st = mod.status(self.store) or {}
+            out.update(state=str(st.get("state") or ""), message=str(st.get("message") or ""),
+                       when=float(st.get("when") or 0))
+            if out["state"] not in ("", "ok"):
+                out["last_error"] = out["message"]
+        except Exception:
+            self.log.error("lookup status failed\n%s", traceback.format_exc())
+        try:
+            out["left"] = int(mod.rate_left(self.store))
+        except Exception:
+            pass
+        return out
+
+    def lookup_note(self, sha256: str) -> dict | None:
+        """A cached MalwareBazaar answer for this file, for its card (no network)."""
+        sha = str(sha256 or "").lower()
+        if not SHA256_RE.match(sha):
+            return None
+        try:
+            row = self.store.get_lookup(sha)
+        except Exception:
+            return None
+        if not row:
+            return None
+        data = row.get("data") if isinstance(row.get("data"), dict) else {}
+        sig = str(data.get("signature") or "")[:200]
+        if row.get("found"):
+            text = f"MalwareBazaar has a copy of this exact file, uploaded as '{sig or 'unnamed'}'."
+        else:
+            text = "MalwareBazaar doesn't know this exact file."
+        return {"found": bool(row.get("found")), "signature": sig, "message": text,
+                "checked": float(row.get("checked") or 0), "link": f"https://bazaar.abuse.ch/sample/{sha}/"}
+
+    def with_lookups(self, rows: list[dict]) -> list[dict]:
+        for r in rows:
+            r["lookup"] = self.lookup_note(r.get("sha256") or "") if r.get("level") in FLAGGED_LEVELS else None
+        return rows
+
+    # ---- Phase 4: website blocking -------------------------------------------------------------
+    def webblock_view(self) -> dict:
+        s = self.settings
+        out = {"enabled": bool(s.webblock_enabled), "available": False, "message": "", "sources": [],
+               "total": 0, "part": None, "busy": False, "allow": list(s.webblock_allow or []),
+               "refresh": dict(self.lists_action), "hosts": self.hosts_view()}
+        mod = self._optional(_load_webblock_lists)
+        if mod is None:
+            out["message"] = WEBBLOCK_NOT_READY
+        else:
+            try:
+                st = mod.status(s) or {}
+                sources = st.get("sources") if isinstance(st.get("sources"), dict) else {}
+                for name in ("phishing", "urlhaus"):
+                    if isinstance(sources.get(name), dict):
+                        out["sources"].append(dict(_simple(sources[name]), name=name))
+                out["total"] = int(st.get("total") or 0)
+                out["busy"] = bool(st.get("busy"))
+                out["available"] = True
+            except Exception:
+                self.log.error("website list status failed\n%s", traceback.format_exc())
+                out["message"] = "Could not read the website lists. Details are in the log."
+        parts = read_guard_state(self.store).get("parts")
+        part = parts.get(WEB_PART[0]) if isinstance(parts, dict) else None
+        if isinstance(part, dict):
+            out["part"] = {"state": str(part.get("state") or ""), "message": str(part.get("message") or "")[:500]}
+        return out
+
+    _plan_cache: tuple[float, dict | None] = (0.0, None)
+
+    def hosts_view(self) -> dict:
+        s = self.settings
+        out = {"enabled": bool(s.webblock_hosts), "every_days": int(s.webblock_hosts_every_days or 7),
+               "available": False, "plan": {}, "message": "", "action": dict(self.hosts_action)}
+        mod = self._optional(_load_webblock_hosts)
+        if mod is None or not callable(getattr(mod, "plan", None)):
+            out["message"] = HOSTS_NOT_READY
+            return out
+        out["available"] = True
+        when, plan = self._plan_cache
+        if plan is None or time.time() - when > 30 or self.hosts_action["running"]:
+            try:
+                raw = mod.plan(s)
+                plan = _simple(raw) if isinstance(raw, dict) else {}
+            except Exception:
+                self.log.error("hosts plan failed\n%s", traceback.format_exc())
+                plan = {}
+                out["message"] = "Could not read the hosts file status. Details are in the log."
+            self._plan_cache = (time.time(), plan)
+        out["plan"] = plan
+        return out
+
+    def _save_settings(self, changes: dict) -> None:
+        """Save a few settings onto what is on disk (as update_settings does)."""
+        disk = load_settings(self.settings.data_dir)
+        for target in (disk, self.settings):
+            for k, v in changes.items():
+                setattr(target, k, v)
+        disk.save()
+
+    def _plain_web_error(self, e: Exception, what: str) -> str:
+        if isinstance(e, ValueError) and str(e):
+            return str(e)
+        if isinstance(e, OSError):
+            return f"Windows stopped {what} ({plain_error(e)}). Details are in the log."
+        return f"{what[0].upper()}{what[1:]} stopped with a problem. Details are in the log."
+
+    def start_hosts_action(self, what: str) -> bool:
+        """Apply or remove TacoGuard's block in the hosts file, on a background thread: Windows shows
+        its admin prompt and the helper waits for your answer. One at a time; False when one runs."""
+        mod = self._optional(_load_webblock_hosts)
+        fn = getattr(mod, HOSTS_ACTIONS[what], None) if mod is not None else None
+        if not callable(fn):
+            raise ApiError(503, HOSTS_NOT_READY)
+        with self.web_lock:
+            if self.hosts_action["running"]:
+                return False
+            self.hosts_action.update(running=True, what=what, message="", error="", started=time.time(),
+                                     finished=0.0, ok=False)
+        words = "changing the hosts file" if what == "apply" else "taking TacoGuard's block out of the hosts file"
+
+        def work():
+            try:
+                out = fn(self.settings)
+                text = str(out or "").strip() or (
+                    "Done." if what == "apply" else "TacoGuard's block is out of the hosts file.")
+                ok = getattr(out, "ok", None)
+                if ok is False:
+                    self.hosts_action["error"] = text
+                else:
+                    self.hosts_action["message"] = text
+                if ok is True:
+                    # your choice is remembered only when the helper did it: keep the block up to
+                    # date (Apply) or not (Remove)
+                    self.hosts_action["ok"] = True
+                    try:
+                        self._save_settings({"webblock_hosts": what == "apply"})
+                    except OSError:
+                        self.log.error("saving the hosts choice failed\n%s", traceback.format_exc())
+            except Exception as e:
+                self.log.error("hosts %s failed\n%s", what, traceback.format_exc())
+                self.hosts_action["error"] = self._plain_web_error(e, words)
+            finally:
+                self._plan_cache = (0.0, None)
+                self.hosts_action["finished"] = time.time()
+                self.hosts_action["running"] = False
+        threading.Thread(target=work, name=f"tacoguard-hosts-{what}", daemon=True).start()
+        return True
+
+    def start_lists_refresh(self) -> bool:
+        """Download the website lists now (webblock.lists.refresh waits at least 30 minutes between
+        contacts with each list's server by itself). One at a time; False when one runs."""
+        mod = self._optional(_load_webblock_lists)
+        if mod is None or not callable(getattr(mod, "refresh", None)):
+            raise ApiError(503, WEBBLOCK_NOT_READY)
+        with self.web_lock:
+            if self.lists_action["running"]:
+                return False
+            self.lists_action.update(running=True, message="", error="", started=time.time(), finished=0.0)
+
+        def work():
+            try:
+                out = mod.refresh(self.settings, self.store) or {}
+                msg = str(out.get("message") or "") if isinstance(out, dict) else ""
+                if isinstance(out, dict) and out.get("busy"):
+                    self.lists_action["message"] = msg or "The website lists are being updated right now."
+                elif isinstance(out, dict) and out.get("ok") is False:
+                    self.lists_action["error"] = msg or "A website list could not be updated. The last good list is kept."
+                else:
+                    self.lists_action["message"] = msg or "The website lists are up to date."
+            except Exception as e:
+                self.log.error("website list refresh failed\n%s", traceback.format_exc())
+                self.lists_action["error"] = self._plain_web_error(e, "updating the website lists")
+            finally:
+                self.lists_action["finished"] = time.time()
+                self.lists_action["running"] = False
+                try:
+                    self.store.close()            # this thread's SQLite connection
+                except Exception:
+                    pass
+        threading.Thread(target=work, name="tacoguard-lists-refresh", daemon=True).start()
+        return True
+
+    # ---- Phase 4: the Home dashboard ----------------------------------------------------------
+    def dashboard_view(self) -> dict:
+        g = self.guard_view()
+        detections = self.store.latest_detections(500)
+        open_ = [d for d in detections if not d.get("action")]
+        n_events = len(self.store.list_guard_events(("new",), limit=200))
+        n_paused = len(self.store.list_paused(("paused",)))
+        recent = self.store.list_jobs(10)
+        last = next((j for j in recent if j["status"] not in JOB_ACTIVE), None)
+        active = next((j for j in recent if j["status"] in JOB_ACTIVE), None)
+        sig = self.signature_status()
+        up = self.updates_view(sig)
+        sig_items = []
+        if isinstance(sig, dict) and not sig.get("error"):
+            for key, label in (("clamav", "ClamAV signatures"), ("yara", "YARA rules"),
+                               ("hash", "Known-bad file lists"), ("ml", "Machine-learning model")):
+                x = sig.get(key)
+                if isinstance(x, dict):
+                    sig_items.append({"name": key, "label": label, "ready": bool(x.get("ready")),
+                                      "updated": x.get("updated") or 0})
+        return {
+            "protection": {k: g[k] for k in ("state", "summary", "alive", "note", "enabled", "paused_until")}
+            | {"parts": [{k: p[k] for k in ("name", "label", "state", "message")} for p in g["parts"]]},
+            "modes": self.modes_view(),
+            "alerts": {"protection": n_events + n_paused, "detections": len(open_),
+                       "malware": sum(1 for d in open_ if d["level"] == MALWARE),
+                       "total": n_events + n_paused + len(open_)},
+            "last_scan": self._scan_brief(last), "scanning": self._scan_brief(active),
+            "updates": {"last_check": up.get("last_check") or 0.0, "next_check": up.get("next_check") or 0.0,
+                        "auto_update": bool(up.get("auto_update")), "checking": bool(up.get("checking")),
+                        "available": bool(up.get("available")),
+                        "stale": (up.get("stale") or {}).get("message") or "", "signatures": sig_items},
+            "webblock": self.webblock_view(),
+            "lookup": self.lookup_view(),
+            "tray": {"enabled": bool(self.settings.tray_enabled), "managed": self.manage_tray,
+                     "running": bool(self.tray is not None and self.tray.running), "note": self.tray_note},
+            "self_protection": self.selfprotect_view(),
+        }
+
+    @staticmethod
+    def _scan_brief(j: dict | None) -> dict | None:
+        if not j:
+            return None
+        c = j.get("counts") or {}
+        result = ("malware" if c.get("malware") else "suspicious" if c.get("suspicious") else
+                  "clean" if j["status"] == "done" else j["status"])
+        return {"id": j["id"], "status": j["status"], "result": result, "counts": c,
+                "started": j.get("started") or 0, "finished": j.get("finished") or 0,
+                "short_targets": [_short(t) for t in j.get("targets") or []]}
+
     # ---- pieces of status ----------------------------------------------------------------
     def signature_status(self) -> dict:
         try:
@@ -1603,6 +2114,7 @@ class App:
             },
             "quarantine": self.quarantine_summary(),
             "protection": self.protection_brief(),
+            "modes": self.modes_view(),
             "setup": {"running": self.setup_state["running"]},
             "busy": bool(active) or self.setup_state["running"],
             "data_dir": str(self.settings.root),
@@ -1667,13 +2179,36 @@ class App:
                                                            "max": REALTIME_MAX_FILE[1]}},
             "realtime_defaults": self.default_folders(),
             "autostart": self.autostart_view(),
+            # Phase 4
+            **{k: bool(getattr(s, k)) for k in PHASE4_SWITCHES},
+            "webblock_hosts_every_days": int(s.webblock_hosts_every_days or 7),
+            "webblock_allow": [str(x) for x in (s.webblock_allow or []) if isinstance(x, str)],
+            "phase4_limits": {"webblock_hosts_every_days": {"min": HOSTS_EVERY_DAYS[0], "max": HOSTS_EVERY_DAYS[1]},
+                              "webblock_allow": {"max": WEB_ALLOW_MAX}},
+            "abusech_key": self.key_view(),
         }
 
     def update_settings(self, body: dict) -> dict:
         changes_limits, priority, threads, trust_signed = {}, None, None, None
         phase2: dict = {}
         phase3: dict = {}
+        phase4_: dict = {}
         for key, value in body.items():
+            if key in PHASE4_SWITCHES:
+                if not isinstance(value, bool):
+                    raise ApiError(400, f"{PHASE4_SWITCHES[key]} must be on or off.")
+                phase4_[key] = value
+                continue
+            if key == "webblock_hosts_every_days":
+                lo, hi, msg = HOSTS_EVERY_DAYS
+                if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                        or value != int(value) or not lo <= value <= hi):
+                    raise ApiError(400, msg)
+                phase4_[key] = int(value)
+                continue
+            if key == "webblock_allow":
+                phase4_[key] = self._web_allow(value)
+                continue
             if key in PHASE3_SWITCHES:
                 if not isinstance(value, bool):
                     raise ApiError(400, f"{PHASE3_SWITCHES[key]} must be on or off.")
@@ -1730,9 +2265,10 @@ class App:
                 raise ApiError(400, f"'{key}' must be between {lo:g} and {hi:g}.")
             changes_limits[key] = kind(value)
         if (not changes_limits and priority is None and threads is None and trust_signed is None
-                and not phase2 and not phase3):
+                and not phase2 and not phase3 and not phase4_):
             raise ApiError(400, "Nothing to change.")
         before = {k: getattr(self.settings, k) for k in phase3}
+        before4 = {k: getattr(self.settings, k) for k in phase4_}
         # save onto what is on disk (so a --port given on the command line is not stored)
         disk = load_settings(self.settings.data_dir)
         for target in (disk, self.settings):
@@ -1748,8 +2284,39 @@ class App:
                 setattr(target, k, v)
             for k, v in phase3.items():
                 setattr(target, k, list(v) if isinstance(v, list) else v)
+            for k, v in phase4_.items():
+                setattr(target, k, v)
         disk.save()
         message = "Saved. The new settings apply to the next scan."
+        changed4 = {k for k, v in phase4_.items() if before4.get(k) != v}
+        if "tray_enabled" in changed4:
+            note = self.apply_tray()
+            if note:
+                message += " " + note
+            elif self.manage_tray:
+                message += (" The TacoGuard icon is in the taskbar." if self.settings.tray_enabled
+                            else " The TacoGuard icon is gone from the taskbar.")
+        if "game_mode_auto" in changed4:
+            self.gamemode.wake()
+            message += (" Game mode now starts by itself during full-screen games and presentations."
+                        if self.settings.game_mode_auto else
+                        " Game mode now starts only when you switch it on.")
+        if changed4 & {"webblock_enabled", "webblock_phishing_list", "webblock_urlhaus_list",
+                       "webblock_allow"} and self.settings.realtime_enabled:
+            message += " Website blocking picks up the change within a few seconds."
+        offer_remove = False
+        if (("webblock_enabled" in changed4 and not self.settings.webblock_enabled)
+                or ("webblock_hosts" in changed4 and not self.settings.webblock_hosts)):
+            offer_remove = self._hosts_block_present()
+            if offer_remove:
+                message += " " + HOSTS_REMOVE_OFFER
+        if "webblock_allow" in changed4 and self._hosts_block_present():
+            message += (" The hosts file block still lists the old choice until you update it "
+                        "('Block in the hosts file', one administrator prompt).")
+        self._plan_cache = (0.0, None)
+        if "self_protection" in changed4:
+            message += (" Self-protection applies the next time TacoGuard starts." if self.settings.self_protection
+                        else " Self-protection is off from the next time TacoGuard starts.")
         changed3 = {k for k, v in phase3.items() if before.get(k) != v}
         if not self.settings.ransomware_guard and (
                 "ransomware_guard" in changed3
@@ -1771,7 +2338,50 @@ class App:
             self._apply_auto_update()
             message += (" Automatic update checks are on." if self.settings.auto_update
                         else " Automatic update checks are off: use Check for updates on Home.")
-        return {"ok": True, "message": message, "settings": self.settings_view()}
+        return {"ok": True, "message": message, "settings": self.settings_view(),
+                "offer_hosts_remove": offer_remove}
+
+    def _hosts_block_present(self) -> bool:
+        """TacoGuard's block is in Windows' hosts file now (anyone may read it). False when the
+        hosts module isn't part of this copy or the file can't be read."""
+        mod = self._optional(_load_webblock_hosts)
+        fn = getattr(mod, "read_block", None) if mod is not None else None
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn(mod.default_hosts_path()).get("present"))
+        except Exception:
+            return False
+
+    def _web_allow(self, value) -> list[str]:
+        """Your "never block these sites" list: website names (example.com), checked and written
+        the way the lists hold them; repeats dropped."""
+        if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+            raise ApiError(400, "The 'never block' list must be a list of website names.")
+        try:
+            from ..webblock.lists import normalize
+        except ImportError:
+            normalize = None
+        out: list[str] = []
+        for raw in value:
+            text = raw.strip()
+            if not text:
+                continue
+            text = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", text, flags=re.I).split("/", 1)[0]
+            if normalize is not None:
+                name = normalize(text)
+            else:
+                name = text.lower() if re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?\.[a-z]{2,63}",
+                                                    text.lower()) else None
+            if not name:
+                shown = raw.strip()[:80]
+                raise ApiError(400, f"'{shown}' isn't a website name. Write it like example.com "
+                                    "(no * and no IP addresses).")
+            if name not in out:
+                out.append(name)
+        if len(out) > WEB_ALLOW_MAX:
+            raise ApiError(400, f"The 'never block' list can hold up to {WEB_ALLOW_MAX} websites.")
+        return out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1809,9 +2419,7 @@ class Api:
 
     @route("POST", r"/api/quit")
     def post_quit(self, m, q, body):
-        srv = self.app.server
-        if srv is not None:
-            threading.Thread(target=srv.shutdown, daemon=True).start()
+        self.app.quit()
         return {"ok": True, "message": "TacoGuard's page is closing. You can close this tab."}
 
     # ---- scans ---------------------------------------------------------------------------
@@ -1850,6 +2458,8 @@ class Api:
             if not only or only == k:
                 rows = self.store.list_result_section(job_id, k, offset if only else 0, limit)
                 out[k] = [_result_for_page(r) for r in rows]
+                if k == "detections":
+                    self.app.with_lookups(out[k])
         return out
 
     @route("POST", r"/api/scan/(\d+)/(pause|cancel|resume)")
@@ -1885,7 +2495,7 @@ class Api:
     @route("GET", r"/api/detections")
     def get_detections(self, m, q, body):
         limit = _int(q, "limit", 200, 1, 1000)
-        return {"detections": [_result_for_page(r) for r in self.store.latest_detections(limit)]}
+        return {"detections": self.app.with_lookups([_result_for_page(r) for r in self.store.latest_detections(limit)])}
 
     def _result(self, result_id: int) -> dict:
         r = self.store.get_result(result_id)
@@ -2248,6 +2858,194 @@ class Api:
         self._resolve_event(row.get("event_id"), self.STARTUP_DONE[action])
         return {"ok": True, "message": out.strip() if isinstance(out, str) and out.strip() else defaults[action]}
 
+    # ---- Phase 4: dashboard, pause, Game mode -----------------------------------------------------
+    @route("GET", r"/api/dashboard")
+    def get_dashboard(self, m, q, body):
+        return self.app.dashboard_view()
+
+    @route("POST", r"/api/protection/pause")
+    def post_protection_pause(self, m, q, body):
+        minutes = body.get("minutes")
+        if (isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or not math.isfinite(minutes)
+                or minutes != int(minutes) or not 0 <= minutes <= PAUSE_MAX_MIN):
+            raise ApiError(400, f"Pause for 1 to {PAUSE_MAX_MIN} minutes, or 0 to resume.")
+        if minutes == 0:
+            self.app.resume_protection()
+            msg = "Real-time protection is on again."
+        else:
+            if not self.settings.realtime_enabled:
+                raise ApiError(409, "Real-time protection is off in Settings, so there is nothing to pause.")
+            until = self.app.pause_protection(int(minutes) * 60)
+            msg = (f"Real-time protection is paused until {time.strftime('%H:%M', time.localtime(until))}. "
+                   "It starts again by itself then, or press Resume. Scans you start yourself still work.")
+        return {"ok": True, "message": msg, "modes": self.app.modes_view()}
+
+    @route("POST", r"/api/gamemode")
+    def post_gamemode(self, m, q, body):
+        on = body.get("on")
+        if not isinstance(on, bool):
+            raise ApiError(400, "Say whether Game mode should be on or off.")
+        self.app.switch_game_mode(on)
+        if on:
+            msg = ("Game mode is on until you turn it off (at the latest for 4 hours, or until TacoGuard "
+                   "restarts). Scans wait, update checks wait and TacoGuard shows no pop-up notifications. "
+                   "Real-time checks keep running.")
+        else:
+            msg = "Game mode is off."
+            if self.settings.game_mode_auto and gamemode.respect_until(self.store) > time.time():
+                msg += " TacoGuard won't switch it on by itself again for the next 2 hours."
+        return {"ok": True, "message": msg, "modes": self.app.modes_view()}
+
+    # ---- Phase 4: website blocking ----------------------------------------------------------------
+    @route("GET", r"/api/webblock")
+    def get_webblock(self, m, q, body):
+        return self.app.webblock_view()
+
+    @route("POST", r"/api/webblock/hosts")
+    def post_webblock_hosts(self, m, q, body):
+        action = self._action(body, ("apply", "remove"))
+        if not self.app.start_hosts_action(action):
+            raise ApiError(409, "TacoGuard is already working on the hosts file. Answer Windows' prompt first "
+                                "(it may be behind this window, blinking in the taskbar).")
+        what = ("block these websites in the hosts file" if action == "apply"
+                else "take TacoGuard's block out of the hosts file")
+        return {"ok": True, "message": f"Windows now asks for permission to {what} (an administrator prompt). "
+                                       "TacoGuard waits for your answer.",
+                "hosts": self.app.hosts_view()}
+
+    @route("POST", r"/api/webblock/refresh")
+    def post_webblock_refresh(self, m, q, body):
+        if not self.settings.webblock_enabled:
+            raise ApiError(409, "Website blocking is off in Settings, so there are no lists to update.")
+        mod = self.app._optional(_load_webblock_lists)
+        busy = getattr(mod, "busy", None) if mod is not None else None
+        if callable(busy):
+            try:
+                is_busy = bool(busy(self.settings))
+            except Exception:
+                is_busy = False
+            if is_busy:
+                raise ApiError(409, "TacoGuard is already updating the website lists in the background. "
+                                    "Wait a few minutes; they show here when it's done.")
+        if not self.app.start_lists_refresh():
+            raise ApiError(409, "TacoGuard is already updating the website lists. Wait for that to finish.")
+        return {"ok": True, "message": "Updating the website lists. This can take a minute."}
+
+    # ---- Phase 4: the abuse.ch key (never echoed, never logged) ------------------------------------
+    @route("POST", r"/api/secrets/abusech")
+    def post_secret_abusech(self, m, q, body):
+        sec = self.app._optional(_load_secrets)
+        if sec is None:
+            raise ApiError(503, SECRETS_NOT_READY)
+        clear = body.get("clear", False)
+        if not isinstance(clear, bool):
+            raise ApiError(400, "Say whether to remove the key.")
+        if clear and "key" in body:
+            raise ApiError(400, "Either paste a key or remove it, not both.")
+        if clear:
+            try:
+                removed = bool(sec.clear_key(self.settings, ABUSECH))
+            except Exception as e:
+                self.app.log.error("removing the abuse.ch key failed (%s)", type(e).__name__)
+                raise ApiError(500, "Windows could not remove the key. Try again.")
+            msg = ("Removed. MalwareBazaar lookups and the URLhaus list stop until you add a key again."
+                   if removed else "There was no key to remove.")
+        elif "key" in body:
+            value = body.get("key")
+            if not isinstance(value, str) or not value.strip() or len(value) > 1000:
+                raise ApiError(400, KEY_BAD_MSG)
+            try:
+                sec.set_key(self.settings, ABUSECH, value)
+            except ValueError as e:
+                text = str(e)
+                squeezed = re.sub(r"\s+", "", value)
+                if not text or (squeezed and squeezed in text) or value.strip() in text:
+                    text = KEY_BAD_MSG              # never show the key back, even by accident
+                raise ApiError(400, text)
+            except Exception as e:
+                self.app.log.error("saving the abuse.ch key failed (%s)", type(e).__name__)
+                raise ApiError(500, KEY_SAVE_FAILED)
+            self.app.log.info("an abuse.ch key was saved")
+            msg = "Saved. MalwareBazaar lookups and the URLhaus list can use your key now."
+        else:
+            raise ApiError(400, "Paste your abuse.ch key first, or choose Remove.")
+        k = self.app.key_view()
+        return {"ok": True, "set": k["set"], "hint": k["hint"], "message": msg}
+
+    # ---- Phase 4: MalwareBazaar lookup of a flagged file ----------------------------------------------
+    def _flagged_sha(self, body) -> tuple[str, str]:
+        """(sha256, short name) of a file TacoGuard flagged; only those are ever looked up."""
+        keys = [k for k in ("result_id", "event_id", "sha256") if k in body]
+        if len(keys) != 1:
+            raise ApiError(400, "Say which file to look up.")
+        key, value = keys[0], body[keys[0]]
+        if key in ("result_id", "event_id"):
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < 2**62:
+                raise ApiError(400, "Say which file to look up.")
+        if key == "result_id":
+            r = self._result(value)
+            if r["level"] not in FLAGGED_LEVELS:
+                raise ApiError(400, "TacoGuard only looks up files it flagged.")
+            sha, path = str(r.get("sha256") or ""), r["path"]
+        elif key == "event_id":
+            ev = self.store.get_guard_event(value)
+            if not ev:
+                raise ApiError(404, "That alert no longer exists.")
+            if ev["level"] not in FLAGGED_LEVELS or not ev["path"] or ev["kind"] not in ("file", "process"):
+                raise ApiError(400, "TacoGuard only looks up files it flagged.")
+            sha, path = str(ev.get("sha256") or ""), ev["path"]
+        else:
+            if not isinstance(value, str) or not SHA256_RE.match(value.strip().lower()):
+                raise ApiError(400, "That isn't a SHA-256 fingerprint (64 letters and digits).")
+            sha = value.strip().lower()
+            path = next((d["path"] for d in self.store.latest_detections(1000)
+                         if (d.get("sha256") or "").lower() == sha and d["level"] in FLAGGED_LEVELS), "")
+            if not path:
+                path = next((e["path"] for e in self.store.list_guard_events(limit=1000)
+                             if (e.get("sha256") or "").lower() == sha and e["level"] in FLAGGED_LEVELS
+                             and e["path"]), "")
+            if not path:
+                raise ApiError(400, "TacoGuard only looks up files it flagged.")
+        sha = sha.lower()
+        if not SHA256_RE.match(sha):
+            raise ApiError(400, "This file has no fingerprint (it couldn't be read), so it can't be looked up. "
+                                "Scan it again first.")
+        return sha, _short(path)
+
+    @route("POST", r"/api/lookup")
+    def post_lookup(self, m, q, body):
+        mod = self.app._optional(_load_lookup)
+        if mod is None:
+            raise ApiError(503, LOOKUP_NOT_READY)
+        sha, short = self._flagged_sha(body)
+        if not self.settings.lookup_enabled:
+            raise ApiError(409, "MalwareBazaar lookups are off in Settings.")
+        if not self.app.key_view()["set"]:
+            raise ApiError(409, "Add your free abuse.ch key in Settings first, then try again.")
+        info = mod.lookup(self.settings, self.store, sha, force=True)
+        if not isinstance(info, dict):
+            msg = ""
+            try:
+                st = mod.status(self.store) or {}
+                if st.get("state") not in ("", "ok"):
+                    msg = str(st.get("message") or "")
+            except Exception:
+                pass
+            raise ApiError(503, msg or "MalwareBazaar didn't answer. TacoGuard will try again later.")
+        found = bool(info.get("found"))
+        if found:
+            sig = str(info.get("signature") or "")
+            text = str(info.get("message") or "") or (
+                f"MalwareBazaar has a copy of this exact file, uploaded as '{sig or 'unnamed'}'.")
+        else:
+            text = (str(info.get("message") or "") or "MalwareBazaar doesn't know this exact file.") + \
+                " That doesn't make it safe: new or rare files are often not listed."
+        return {"ok": True, "found": found, "message": f"{short}: {text}",
+                "signature": str(info.get("signature") or ""), "file_type": str(info.get("file_type") or ""),
+                "first_seen": str(info.get("first_seen") or ""),
+                "tags": [str(t) for t in (info.get("tags") or []) if isinstance(t, str)][:20],
+                "link": f"https://bazaar.abuse.ch/sample/{sha}/", "lookup": self.app.lookup_note(sha)}
+
     # ---- quarantine -------------------------------------------------------------------------
     @route("GET", r"/api/quarantine")
     def get_quarantine(self, m, q, body):
@@ -2434,8 +3232,13 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def log_message(self, fmt, *args):
+        # Only the request line is logged, never a body. A query string on the key route is cut
+        # off too, in case something ever sends a key that way.
         try:
-            self.app.log.info("%s %s", self.address_string(), fmt % args)
+            text = fmt % args
+            if SECRET_PATH_PREFIX in text:
+                text = re.sub(r"(/api/secrets/[^\s?\"]*)\?[^\s\"]*", r"\1?(hidden)", text)
+            self.app.log.info("%s %s", self.address_string(), text)
         except Exception:
             pass
 
@@ -2669,7 +3472,8 @@ def is_tacoguard_at(port: int, timeout: float = 3.0) -> bool:
 
 def serve(settings, open_browser: bool = True, guard: bool | None = None) -> int:
     """The page. guard=None starts real-time protection (the guard process, when
-    settings.realtime_enabled) except while pytest runs: a test never starts the real guard."""
+    settings.realtime_enabled), self-protection, automatic Game mode and the tray icon, except
+    while pytest runs: a test never starts the real guard or adds a real icon."""
     if guard is None:
         guard = not os.environ.get("PYTEST_CURRENT_TEST")
     app = App(settings)
@@ -2692,7 +3496,10 @@ def serve(settings, open_browser: bool = True, guard: bool | None = None) -> int
     app.startup()
     app.start_updates()   # finishes an update cut off last time, then checks (settings.auto_update)
     if guard:
+        app.harden()       # self-protection (settings.self_protection) before anything else starts
         app.start_guard()  # real-time protection (settings.realtime_enabled), stopped by app.close()
+        app.start_gamemode()   # automatic Game mode (settings.game_mode_auto)
+        app.start_tray()   # the notification-area icon (settings.tray_enabled), removed by app.close()
     defender.peek()  # start reading Defender's status in the background
     print(f"TacoGuard is running at {url}")
     print("Keep this window open while you use the page. Press Ctrl+C here to stop.")

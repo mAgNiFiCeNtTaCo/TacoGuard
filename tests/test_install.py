@@ -88,7 +88,12 @@ def test_layout(installed):
     assert not (vdir / "tests").exists()
     assert sorted(rel for rel, _ in inst.package_files(ROOT)) == sorted(
         p.relative_to(vdir).as_posix() for p in vdir.rglob("*")
-        if p.is_file() and "__pycache__" not in p.parts and p.name != "requirements.lock")
+        if p.is_file() and "__pycache__" not in p.parts
+        and p.name not in ("requirements.lock", "tacoguard-files.json"))
+    # Phase 4: the hash list of this version (selfprotect.py) matches what was installed
+    from tacoguard import selfprotect
+    assert (vdir / selfprotect.MANIFEST_NAME).is_file()
+    assert selfprotect.check_install(version_dir=vdir, root=root) == []
     cur = json.loads((root / "current.json").read_text(encoding="utf-8"))
     assert cur["version"] == v and cur["previous"] is None
     assert (root / "TacoGuard.pyw").is_file() and (root / "TacoGuard.cmd").is_file()

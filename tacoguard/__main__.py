@@ -6,6 +6,7 @@
     python -m tacoguard status [--data DIR]                             signature status
     python -m tacoguard install [--shortcut] [--offline]                per-user installed copy
     python -m tacoguard uninstall                                       remove the installed copy
+    python -m tacoguard hosts status|remove [--data DIR]                TacoGuard's hosts-file block
     python -m tacoguard selftest [--data DIR]                           check this copy works
     python -m tacoguard version                                         print the version
 """
@@ -14,6 +15,45 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+
+
+def _self_protect(settings) -> None:
+    """Phase 4, at page start: harden this process and compare the installed copy's files with
+    the list written at install (tacoguard/selfprotect.py). A failure never stops the page."""
+    try:
+        from . import selfprotect
+        selfprotect.maybe_harden(settings)
+        if not getattr(settings, "self_protection", True):
+            return
+        from .store import Store
+        problems = selfprotect.check_install(settings)
+        if problems:
+            st = Store(settings.db_path)
+            try:
+                selfprotect.report_install_check(settings, st, problems)
+            finally:
+                st.close()
+    except Exception:
+        pass
+
+
+def hosts_command(settings, action: str, *, launcher=None, hosts_path=None, out=print) -> int:
+    """`python -m tacoguard hosts status|remove`. remove = one Windows admin prompt through
+    TacoGuard's hosts helper (webblock/hosts.py); status only reads. 0 = fine / done."""
+    from .webblock import hosts
+    if action == "status":
+        p = hosts.plan(settings, hosts_path=hosts_path)
+        b = p["block"]
+        if not b["readable"]:
+            out("Windows didn't let TacoGuard read the hosts file.")
+            return 1
+        out(f"TacoGuard's block is in the hosts file ({b['count']:,} websites)." if b["present"]
+            else "The hosts file has no TacoGuard block.")
+        out(p["message"])
+        return 0
+    res = hosts.remove_elevated(settings, launcher=launcher, hosts_path=hosts_path)
+    out(str(res))
+    return 0 if getattr(res, "ok", False) else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -33,6 +73,8 @@ def main(argv: list[str] | None = None) -> int:
     p_inst.add_argument("--offline", action="store_true",
                         help="copy the needed parts from this Python instead of downloading them with pip")
     sub.add_parser("uninstall", help="remove the installed copy (your data folder is kept)")
+    p_hosts = sub.add_parser("hosts", help="TacoGuard's block in Windows' hosts file: status, or remove it")
+    p_hosts.add_argument("action", choices=("status", "remove"))
     sub.add_parser("selftest", help="check that this copy of TacoGuard works (nothing is started)")
     sub.add_parser("version", help="print TacoGuard's version")
     args = ap.parse_args(argv)
@@ -46,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
         where = "installed copy" if running_from_install() else "project folder"
         print(f"TacoGuard {__version__} ({where})")
         return 0
+    if args.cmd == "hosts":
+        return hosts_command(load_settings(args.data), args.action)
     if args.cmd in ("install", "uninstall", "selftest"):
         from . import install as inst
         settings = load_settings(args.data)
@@ -72,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
             settings.port = args.port
         from .selfupdate import report_health_when_up
         report_health_when_up(settings)      # installed copy: tells a self-update "started OK"
+        _self_protect(settings)
         return serve(settings, open_browser=not args.no_browser) or 0
 
     if args.cmd == "setup":

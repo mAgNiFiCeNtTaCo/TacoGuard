@@ -53,6 +53,34 @@ ENDPOINTS = [
         "sends": "Nothing about you or your files (freshclam sends its version number).",
     },
     {
+        "host": "phish.co.za",
+        "why": "Downloads Phishing.Database's list of active phishing websites (MIT license), used to warn "
+               "about and block those sites.",
+        "when": UPDATE_WHEN,
+        "sends": "Nothing about you or your files.",
+    },
+    {
+        "host": "raw.githubusercontent.com",
+        "why": "A second place to download the same Phishing.Database list (its official GitHub copy), "
+               "used only when phish.co.za doesn't answer.",
+        "when": UPDATE_WHEN,
+        "sends": "Nothing about you or your files.",
+    },
+    {
+        "host": "urlhaus-api.abuse.ch",
+        "why": "Downloads URLhaus's list of websites that spread malware (abuse.ch), only after you add your "
+               "own free abuse.ch key in Settings.",
+        "when": UPDATE_WHEN,
+        "sends": "Your abuse.ch key (it identifies your free account). Nothing about your files.",
+    },
+    {
+        "host": "mb-api.abuse.ch",
+        "why": "Looks up the fingerprint (SHA-256 hash) of a file TacoGuard flagged on MalwareBazaar, only "
+               "after you add your own abuse.ch key, to see whether it is known malware.",
+        "when": "When a scan or real-time protection flags a file, and when you press 'Look up'.",
+        "sends": "The file's SHA-256 hash and your abuse.ch key. Never the file, its name or its contents.",
+    },
+    {
         "host": "current.cvd.clamav.net",
         "why": "freshclam looks up this name (a DNS question, no download) to learn the newest signature versions, so it downloads only when something changed.",
         "when": UPDATE_WHEN,
@@ -110,6 +138,17 @@ class Settings:
     persistence_watch: bool = True            # report new start-up entries
     realtime_max_file_size: int = 256 * 1024**2   # bigger new files: noted, "scan it from the Scan tab"
     realtime_clamav_second_opinion: bool = True   # start ClamAV only for a file another check flagged
+    # ---- Phase 4 (contract: tacoguard/phase4.py) --------------------------------------------
+    webblock_enabled: bool = True             # download bad-domain lists + watch for programs contacting them
+    webblock_phishing_list: bool = True       # Phishing.Database active domains (MIT, no key)
+    webblock_urlhaus_list: bool = True        # URLhaus malware domains (needs your abuse.ch key)
+    webblock_hosts: bool = False              # also block in Windows' hosts file (admin prompt per update)
+    webblock_hosts_every_days: int = 7        # at most this often TacoGuard offers a hosts update
+    webblock_allow: list = field(default_factory=list)   # your "never block these sites" (domains)
+    lookup_enabled: bool = True              # MalwareBazaar hash lookups for flagged files (needs the key)
+    tray_enabled: bool = True                 # the icon in the taskbar's notification area
+    game_mode_auto: bool = True               # full-screen game / presentation -> Game mode on by itself
+    self_protection: bool = True              # harden TacoGuard's own processes, watch its own files
     # ---- derived paths -------------------------------------------------------------
     @property
     def root(self) -> Path:
@@ -163,10 +202,18 @@ class Settings:
     def guard_dir(self) -> Path:               # Phase 3: decoy manifest, start-up entry backups
         return self.root / "guard"
 
+    @property
+    def webblock_dir(self) -> Path:            # Phase 4: domain lists (current/previous), hosts backup
+        return self.root / "webblock"
+
+    @property
+    def secrets_dir(self) -> Path:             # Phase 4: your abuse.ch key (DPAPI-protected)
+        return self.root / "secrets"
+
     def ensure_dirs(self) -> None:
         for p in (self.root, self.clamav_program_dir.parent, self.clamav_db_dir, self.yara_dir,
                   self.hashset_dir, self.quarantine_dir, self.tmp_dir, self.log_dir, self.ml_dir,
-                  self.updates_dir, self.guard_dir):
+                  self.updates_dir, self.guard_dir, self.webblock_dir, self.secrets_dir):
             p.mkdir(parents=True, exist_ok=True)
 
     # ---- load / save ---------------------------------------------------------------
@@ -210,28 +257,60 @@ def clamav_thread_count(settings) -> int:
     return max(1, min(CLAMAV_THREADS_MAX, n))
 
 
-def secure_root(settings: "Settings") -> str:
+# broad groups whose own entries the forced lock takes out (Everyone, Users, Authenticated Users,
+# Interactive, Guests, Local, Anonymous)
+BROAD_GROUP_SIDS = ("S-1-1-0", "S-1-5-32-545", "S-1-5-11", "S-1-5-4", "S-1-5-32-546", "S-1-2-0", "S-1-5-7")
+
+
+def secure_root(settings: "Settings", force: bool = False) -> str:
     """Lock the data folder to the current user, SYSTEM and Administrators (no admin rights needed:
-    the user owns the folder). Done once; a marker file records it. Returns a plain-English note."""
+    the user owns the folder). Done once; a marker file records it. Returns a plain-English note.
+
+    force=True (self-protection found it opened again): lock it again although the marker says it
+    was done. The marker is never deleted first, so a failed relock still counts as "was locked"
+    and is looked at again; the broad groups' own entries are taken out (/grant:r keeps entries
+    of other accounts), and first-level subfolders with their own entries for those groups are
+    reset to inherit the lock (icacls /reset)."""
     import getpass
     import subprocess
 
     root = settings.root
     root.mkdir(parents=True, exist_ok=True)
     marker = root / ".locked"
-    if marker.exists():
+    if marker.exists() and not force:
         return "Data folder already locked to your account and administrators."
     user = os.environ.get("USERDOMAIN", "") + "\\" + getpass.getuser() if os.environ.get("USERDOMAIN") \
         else getpass.getuser()
     icacls = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icacls.exe")
-    cmd = [icacls, str(root), "/inheritance:r",
-           "/grant:r", f"{user}:(OI)(CI)F",
-           "/grant:r", "*S-1-5-18:(OI)(CI)F",        # SYSTEM
-           "/grant:r", "*S-1-5-32-544:(OI)(CI)F"]    # Administrators
-    r = subprocess.run(cmd, capture_output=True, text=True, creationflags=0x08000000)
-    if r.returncode != 0:
-        return "Could not lock the data folder: " + (r.stderr or r.stdout).strip()
-    marker.write_text("locked by TacoGuard\n", encoding="utf-8")
+
+    def run(args) -> tuple[bool, str]:
+        try:
+            r = subprocess.run([icacls, *args], capture_output=True, text=True, creationflags=0x08000000,
+                               timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, str(e)
+        return r.returncode == 0, (r.stderr or r.stdout or "").strip()
+
+    ok, out = run([str(root), "/inheritance:r",
+                   "/grant:r", f"{user}:(OI)(CI)F",
+                   "/grant:r", "*S-1-5-18:(OI)(CI)F",        # SYSTEM
+                   "/grant:r", "*S-1-5-32-544:(OI)(CI)F"])   # Administrators
+    if not ok:
+        return "Could not lock the data folder: " + out
+    if force:
+        ok, out = run([str(root), "/remove:g", *(f"*{sid}" for sid in BROAD_GROUP_SIDS)])
+        if not ok:
+            return "Could not take the open entries off the data folder: " + out
+        try:
+            from .selfprotect import open_subfolders
+            for sub in open_subfolders(root):
+                ok, out = run([str(sub), "/reset"])
+                if not ok:
+                    return f"Could not lock the folder {sub.name} inside the data folder: " + out
+        except ImportError:
+            pass
+    if not marker.exists():
+        marker.write_text("locked by TacoGuard\n", encoding="utf-8")
     return "Data folder locked to your account and administrators."
 
 

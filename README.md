@@ -70,7 +70,44 @@ While TacoGuard runs, a small background checker (the "guard") watches as things
 TacoGuard never quarantines or deletes anything by itself: it pauses, reports and waits for you.
 Alerts also show as Windows notifications when notifications are switched on in Windows' settings.
 
-Coming in Phase 4: blocking known bad websites, a tray icon and a Game mode.
+
+### Bad websites
+
+- **Lists:** TacoGuard downloads a list of active phishing sites (Phishing.Database, free) and, once
+  you add your own free abuse.ch key in Settings, URLhaus's list of sites that spread malware.
+- **Blocking in every browser:** press **Block in every browser** and Windows asks for administrator
+  permission. TacoGuard then writes its own marked section into Windows' `hosts` file, which sends
+  each bad site to nowhere (0.0.0.0). The first time, the prompt shows "Windows PowerShell": TacoGuard
+  installs a small helper into `C:\Program Files\TacoGuard`, a folder only administrators can change,
+  and later updates run that helper (one prompt, at most once a week, or when you click). Lines in
+  the hosts file that aren't TacoGuard's stay as they are, and you can take the block out any time
+  (Settings, or `python -m tacoguard hosts remove`). Sites you trust go on the "never block" list.
+- **Noticing:** where Windows lets a normal account read its list of recently looked-up sites,
+  TacoGuard also tells you when your PC looked up a listed site. It never pauses a program for that:
+  other sites can share the same address. (Some Windows versions keep that list for administrators;
+  then blocking in the hosts file is what protects you.)
+
+### More
+
+- **MalwareBazaar lookup** (with your abuse.ch key): for a file TacoGuard flagged, its fingerprint
+  (SHA-256) is looked up on MalwareBazaar, never the file or its name. A file listed there under a
+  malware name and without a valid digital signature counts as malware; otherwise the listing is shown
+  as a hint, because anyone can upload to MalwareBazaar.
+- **Tray icon:** green when all is well, orange when something needs you, grey when protection is
+  paused. Right-click: open the page, pause protection for an hour, Game mode, check for updates, quit.
+- **Game mode:** turns on by itself during full-screen games and presentations (or from the tray, for
+  up to 4 hours). Scans and update checks wait and no notifications pop up; real-time checks keep
+  running.
+- **Self-protection:** programs without administrator rights can't end or freeze TacoGuard, by accident
+  or on purpose (an administrator still can). TacoGuard checks its own installed files at start and
+  tells you when its sign-in entry or data folder was changed by another program.
+
+### Your abuse.ch key
+
+URLhaus and MalwareBazaar are run by abuse.ch and need a free personal key: sign in at
+https://auth.abuse.ch/ (with GitHub, Google, LinkedIn or X), generate an Auth-Key and paste it into
+Settings. It is stored encrypted for your Windows account and only its last 4 characters are ever
+shown. abuse.ch's data is free for not-for-profit use; TacoGuard never uses it to train anything.
 
 ## Getting started
 
@@ -125,10 +162,12 @@ python -m tacoguard selftest       check that this copy works
 ## Internet use
 
 TacoGuard contacts GitHub (the ClamAV program, the YARA Forge rules and TacoGuard's own signed
-releases, each checked before use) and `database.clamav.net` (through ClamAV's own updater, which
-checks Cisco Talos's digital signatures). It does so at start, every 4 hours while it runs, and
-when you press **Check for updates**. The Settings page lists every address it can contact. It
-never sends your files, their names or anything about you.
+releases, each checked before use), `database.clamav.net` (through ClamAV's own updater, which
+checks Cisco Talos's digital signatures) and `phish.co.za` (the phishing list, or its GitHub copy).
+With your abuse.ch key it also contacts `urlhaus-api.abuse.ch` (the malware-site list) and
+`mb-api.abuse.ch` (fingerprints of flagged files only). It does so at start, every 4 hours while it
+runs, and when you press **Check for updates**. The Settings page lists every address it can
+contact. It never sends your files, their names or anything about you.
 
 ## How updates are checked
 

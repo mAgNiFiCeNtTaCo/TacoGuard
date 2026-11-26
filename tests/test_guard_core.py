@@ -702,6 +702,7 @@ def fast_guard(monkeypatch):
     specs["processes"] = (lambda g: StubPart(), specs["processes"][1], specs["processes"][2])
     specs["ransomware"] = (lambda g: StubPart(), specs["ransomware"][1], specs["ransomware"][2])
     specs["persistence"] = (lambda g: StubPart(), specs["persistence"][1], specs["persistence"][2])
+    specs["web"] = (lambda g: StubPart(), specs["web"][1], specs["web"][2])      # Phase 4 part
     monkeypatch.setattr(service, "PART_SPECS", specs)
     return specs
 
@@ -731,7 +732,7 @@ def test_guard_start_stop_and_heartbeat_shape(settings, store, watched, det, fas
         assert set(hb) == {"pid", "started", "heartbeat", "version", "parts", "notes"}
         assert hb["notes"] == []
         assert hb["pid"] == os.getpid() and hb["version"]
-        assert set(hb["parts"]) == {"folders", "processes", "ransomware", "persistence"}
+        assert set(hb["parts"]) == {"folders", "processes", "ransomware", "persistence", "web"}
         for part in hb["parts"].values():
             assert set(part) == {"state", "message", "watched", "checked"}
         assert hb["parts"]["folders"]["state"] == "on"

@@ -2,8 +2,9 @@
 
 check_file() decides one file: trusted folder -> clean cache -> read once (hash + content) ->
 trusted hash -> every detector -> files inside archives -> (only if something matched) the
-file's digital signature (settings.trust_signed_programs). scan_job() walks the targets, keeps the
-job row up to date (a few times a second, not per file) and obeys pause / cancel.
+file's digital signature (settings.trust_signed_programs) and (Phase 4) a MalwareBazaar lookup of
+its fingerprint (add_lookup). scan_job() walks the targets, keeps the job row up to date (a few
+times a second, not per file), obeys pause / cancel and waits between files while Game mode is on.
 
 ClamAV is slow (clamd checks about 2 MB/s of Windows programs per thread), so a scan job sends
 several files to it at once: the hash and YARA checks run here one file at a time, the ClamAV
@@ -45,7 +46,11 @@ NO_SIGNATURES_MSG = ("Nothing was checked: no signatures are installed yet. Pres
 NO_CHECKS_MSG = "Nothing was checked: none of the checks could start."
 
 DETECTOR_LABELS = {"hash": "Known-bad file list", "yara": "YARA rules", "clamav": "ClamAV",
-                   "ml": "The machine-learning check"}
+                   "ml": "The machine-learning check", "lookup": "The MalwareBazaar lookup"}
+
+GAME_MODE_WAIT_MSG = "Waiting: Game mode is on. The scan carries on when it ends."
+GAME_MODE_POLL_S = 5.0        # while waiting: how often Game mode is looked at
+GAME_MODE_CHECK_S = 1.0       # while scanning: at most this often
 
 COUNT_KEYS = ("files", "bytes", "clean", "suspicious", "malware", "trusted", "skipped",
               "unreadable", "incomplete", "archives_members")
@@ -207,7 +212,7 @@ def _signature_can_soften(f: Finding) -> bool:
     """Matches a valid digital signature may soften: those about the file on disk itself (never a
     file inside an archive), not an exact known-bad hash, not a ClamAV 'revoked certificate' or
     test-file name."""
-    if f.member or f.engine == "hash":
+    if f.member or f.engine in ("hash", "lookup"):
         return False
     return f.engine != "clamav" or clamav_names.signature_trust_applies(f.rule)
 
@@ -236,6 +241,47 @@ def _signature_trust(r: FileResult, item: ScanItem, settings) -> bool:
         return True
     r.findings = [f for f in r.findings if not any(f is t for t in targets)]
     r.notes.append(signature_note(targets, signer))
+    return True
+
+
+def _validly_signed(item: ScanItem | None) -> bool:
+    if item is None or not item.path or item.member:
+        return False
+    try:
+        return bool(signing.check_signature(item.path).valid)
+    except Exception:
+        return False
+
+
+def add_lookup(r: FileResult, settings, store, item: ScanItem | None = None) -> bool:
+    """Phase 4 (tacoguard/lookup.py): when the file on disk was flagged (suspicious or malware),
+    settings.lookup_enabled and your abuse.ch key is saved, its SHA-256 is looked up on
+    MalwareBazaar (cached, at most 30 an hour). Known there with a malware name and the file has
+    no valid digital signature -> a HIGH "lookup" finding (the file becomes "malware"); known
+    otherwise -> a MEDIUM one ("has a copy ... not proof on its own"); not known -> a note.
+    Offline / no answer -> nothing changes. Never for clean files, and only the outer file's
+    fingerprint (never a file inside an archive). Returns True when it changed the result."""
+    if r.status != SCANNED or not r.findings or not r.sha256:
+        return False
+    if any(f.engine == "lookup" for f in r.findings):
+        return False
+    from .. import lookup
+    try:
+        if not lookup.ready(settings):
+            return False
+        info = lookup.lookup(settings, store, r.sha256)
+    except Exception:              # lookup() never raises; belt and braces for the scan
+        return False
+    if info is None:
+        return False
+    signed = None                       # not checked: finding_for then says MEDIUM
+    if info.get("found") and info.get("signature") and item is not None:
+        signed = _validly_signed(item)
+    f = lookup.finding_for(info, signed=signed)
+    if f is not None:
+        r.findings.append(f)
+    elif lookup.NOT_FOUND_NOTE not in r.notes:
+        r.notes.append(lookup.NOT_FOUND_NOTE)
     return True
 
 
@@ -337,6 +383,9 @@ def _start_file(entry, detectors, trust, settings, store, sig_version, throttle,
         # Neither is a file your earlier choices changed: "Forget", "It's a threat" or turning
         # learning off must check it again.
         softened = _signature_trust(r, item, settings)
+        # Phase 4: a flagged file's own fingerprint asked on MalwareBazaar, last, so neither your
+        # earlier choices nor a digital signature can soften an exact known-malware match.
+        add_lookup(r, settings, store, item)
         if not r.findings and not r.incomplete and not softened and not learned:
             store.cache_put(cache_key, st.st_size, st.st_mtime_ns, r.sha256, sig_version)
 
@@ -516,6 +565,11 @@ class _Window:
         while self.items:
             self._report_first()
 
+    def report_done(self) -> None:
+        """Reports the files at the front that are finished, without waiting for any."""
+        while self.items and self.items[0][1].done():
+            self._report_first()
+
     def stop(self) -> None:
         """Pause / cancel: drop pool work that has not started, then report files in order up to
         the first dropped one. The files after it are checked again on resume."""
@@ -572,12 +626,19 @@ def _loop(settings, store, job, detectors, sig_version, progress) -> str:
     if any(getattr(d, "parallel", False) for d in detectors):
         pool = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="tacoguard-clamav")
     window = _Window(2 * threads, WINDOW_MAX_BYTES, report)
+    game_checked = 0.0
     try:
         for thing in walker.walk(job["targets"], job["checkpoint"], settings.limits.max_file_size):
             control = (store.get_job(job_id) or {}).get("control", "")
             if control in ("pause", "cancel"):
                 window.stop()
                 return control
+            if time.monotonic() - game_checked >= GAME_MODE_CHECK_S:
+                game_checked = time.monotonic()
+                control = _wait_for_game_mode(store, job_id, progress, window)
+                if control:
+                    window.stop()
+                    return control
             stats: dict = {}
             if isinstance(thing, walker.WalkNote):
                 pending = Pending(note_result(thing))
@@ -599,6 +660,42 @@ def _loop(settings, store, job, detectors, sig_version, progress) -> str:
     finally:
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
+
+
+def _game_mode_on(store) -> bool:
+    from .. import phase4
+    try:
+        return phase4.game_mode(store)["active"]
+    except Exception:
+        return False
+
+
+def _wait_for_game_mode(store, job_id, progress, window) -> str:
+    """Between two files: while Game mode is on, the scan waits (Game mode looked at every
+    GAME_MODE_POLL_S, pause / cancel every second, heartbeat and counts kept up to date; files
+    whose checks finished meanwhile are reported, so the checkpoint stays right). Returns ''
+    when the scan may carry on, else 'pause' or 'cancel'. Waiting time doesn't count as scan time."""
+    if not _game_mode_on(store):
+        return ""
+    t0 = time.monotonic()
+    progress.current = ""
+    progress.flush(message=GAME_MODE_WAIT_MSG)
+    next_look = time.monotonic() + GAME_MODE_POLL_S
+    try:
+        while True:
+            time.sleep(min(1.0, GAME_MODE_POLL_S))
+            control = (store.get_job(job_id) or {}).get("control", "")
+            if control in ("pause", "cancel"):
+                return control
+            if time.monotonic() >= next_look:
+                next_look = time.monotonic() + GAME_MODE_POLL_S
+                window.report_done()
+                if not _game_mode_on(store):
+                    return ""
+                progress.flush(message=GAME_MODE_WAIT_MSG)     # heartbeat + counts
+    finally:
+        progress.t0 += time.monotonic() - t0     # not counted as checking time
+        progress.flush()
 
 
 def _finish(store, job_id, progress, stopped, extra) -> None:

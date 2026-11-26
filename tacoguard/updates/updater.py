@@ -7,6 +7,13 @@ Components, checked one at a time in this order:
     ml_model           TacoGuard's own signed package, test-loaded by detect.ml.self_test(folder)
     app                TacoGuard's own signed package, only downloaded + verified and RECORDED
                        (status()["app_update"]); installing is selfupdate.py's job, on a user click
+    web_lists          Phase 4 bad-website lists (webblock.lists.refresh: checked + swapped there,
+                       at most every 30 minutes per list whatever the cadence)
+
+Game mode (phase4.game_mode(store)["active"]): the timed checks (at start and every
+update_interval_h) wait until Game mode ends (looked at every GAME_MODE_RETRY_S, logged once per
+wait), but after GAME_MODE_MAX_DEFER_S (24 h) of waiting they run anyway; a manual check_now()
+still runs.
 
 Files in settings.updates_dir:
     trusted.json        trusted root + last targets version (signed.py)
@@ -35,11 +42,14 @@ from .. import __version__, config, setup_fetch
 from . import signed, sources
 from .signed import UpdateRejected
 
-COMPONENTS = ("clamav_signatures", "yara_rules", "ml_model", "app")
+COMPONENTS = ("clamav_signatures", "yara_rules", "ml_model", "app", "web_lists")
+STAGED_COMPONENTS = ("clamav_signatures", "yara_rules", "ml_model")   # swapped by this updater
 LABELS = {"clamav_signatures": "ClamAV signatures", "yara_rules": "YARA rules",
-          "ml_model": "machine-learning model", "app": "TacoGuard app"}
+          "ml_model": "machine-learning model", "app": "TacoGuard app", "web_lists": "website lists"}
 MAX_ROOT_STEPS = 64
 PENDING_POLL_S = 30
+GAME_MODE_RETRY_S = 60
+GAME_MODE_MAX_DEFER_S = 24 * 3600      # timed checks put off by Game mode run anyway after this
 LOG_MAX = 1024 * 1024
 ML_UNPACK_MAX = 1024**3
 _LOG_LOCK = threading.Lock()
@@ -204,6 +214,7 @@ class Updater:
             source = sources.LocalFolderSource(Path(os.environ["TACOGUARD_RELEASE_DIR"]))
         self.source = source if source is not None else sources.GitHubReleaseSource(config.RELEASE_REPO)
         self.ml_self_test = None          # tests may set a callable(folder); default: detect.ml.self_test
+        self.web_lists_refresh = None     # tests may set a callable(settings, store, progress) -> dict
         self._lock = threading.Lock()     # guards _status / _pending
         self._check_lock = threading.Lock()
         self._swap_lock = threading.Lock()
@@ -211,6 +222,7 @@ class Updater:
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._recovered = False
+        self._game_deferred_since = 0.0     # a timed check has waited for Game mode since then
         self._pending: dict[str, dict] = {}
         saved = _read_json(self._path("status.json"))
         comps = saved.get("components") if isinstance(saved.get("components"), dict) else {}
@@ -349,7 +361,10 @@ class Updater:
             if not self._recovered:
                 self.recover()
             if on_start and getattr(self.settings, "auto_update", True):
-                self._check_all(blocking=False)
+                if self._defer_for_game_mode():
+                    pass
+                else:
+                    self._check_all(blocking=False)
             else:
                 self._schedule_next()
             while not self._stop.is_set():
@@ -372,7 +387,8 @@ class Updater:
                     self.apply_pending()
                 if getattr(self.settings, "auto_update", True) and next_check and \
                         time.time() >= next_check:
-                    self._check_all(blocking=False)
+                    if not self._defer_for_game_mode():
+                        self._check_all(blocking=False)
         except Exception:
             log(self.settings, "updater thread stopped: " + traceback.format_exc())
         finally:
@@ -389,6 +405,34 @@ class Updater:
             self.store.close()            # this thread's own connection only
         except Exception:
             pass
+
+    def _game_mode_active(self) -> bool:
+        try:
+            from .. import phase4
+            return bool(phase4.game_mode(self.store)["active"])
+        except Exception:
+            return False
+
+    def _defer_for_game_mode(self) -> bool:
+        """A timed check is due. True when it waits for Game mode (looked at again every
+        GAME_MODE_RETRY_S, logged once per wait); after GAME_MODE_MAX_DEFER_S of waiting it runs
+        anyway (signatures must not get days old behind a Game mode left on)."""
+        now = time.time()
+        if not self._game_mode_active():
+            if self._game_deferred_since:
+                log(self.settings, "Game mode ended: the timed update check runs now")
+            self._game_deferred_since = 0.0
+            return False
+        if not self._game_deferred_since:
+            self._game_deferred_since = now
+            log(self.settings, "Game mode is on: the timed update check waits until it ends")
+        elif now - self._game_deferred_since >= GAME_MODE_MAX_DEFER_S:
+            log(self.settings, "Game mode has been on for 24 hours: the timed update check runs anyway")
+            self._game_deferred_since = 0.0
+            return False
+        with self._lock:
+            self._status["next_check"] = now + GAME_MODE_RETRY_S
+        return True
 
     def _schedule_next(self) -> None:
         with self._lock:
@@ -415,6 +459,7 @@ class Updater:
                                ("yara_rules", self._check_yara)):
                 self._guard(name, step)
             self._check_own_channel()
+            self._guard("web_lists", self._check_web_lists)
             with self._lock:
                 self._status["last_check"] = time.time()
             self.apply_pending()
@@ -550,6 +595,40 @@ class Updater:
         new_meta = setup_fetch.stage_yara_rules(s, release, stage, self._progress(name))
         self._stage_ready(name, stage, version=release["tag"],
                           message=setup_fetch.yara_installed_words(new_meta))
+
+    # ---- website lists (Phase 4) -------------------------------------------------------------
+    def _check_web_lists(self) -> None:
+        """webblock.lists.refresh checks and swaps the lists itself (it never raises); this maps its
+        answer to the component's state: ok | offline | error | off."""
+        name = "web_lists"
+        if not getattr(self.settings, "webblock_enabled", True):
+            self._set(name, state="off", message="Website blocking is turned off in Settings.",
+                      last_error="")
+            return
+        refresh = self.web_lists_refresh
+        if refresh is None:
+            from ..webblock import lists as web_lists
+            refresh = web_lists.refresh
+        res = refresh(self.settings, self.store, self._progress(name)) or {}
+        if res.get("busy"):
+            # the page's "Update the lists now" (or another TacoGuard process) is doing it right now
+            self._set(name, message=str(res.get("message") or ""))
+            return
+        sources = {k: v for k, v in (res.get("sources") or {}).items() if isinstance(v, dict)}
+        active = [v for v in sources.values() if v.get("state") not in ("off", "no_key")]
+        message = str(res.get("message") or "")
+        total = sum(int(v.get("count") or 0) for v in sources.values() if v.get("state") != "off")
+        version = f"{total:,} sites" if total else ""
+        if active and all(v.get("state") == "offline" for v in active):
+            state, last_error = "offline", ""
+        elif any(v.get("state") in ("error", "refused") for v in active) or res.get("ok") is False:
+            state, last_error = "error", message
+        elif not active:
+            state, last_error = "off", ""
+        else:
+            state, last_error = "ok", ""
+        extra = {"updated": time.time()} if res.get("changed") else {}
+        self._set(name, state=state, message=message, last_error=last_error, version=version, **extra)
 
     # ---- TacoGuard's own channel (ML model + app) ----------------------------------------
     def _check_own_channel(self) -> None:
@@ -833,7 +912,7 @@ class Updater:
                 comp = child.name[: -len(".ready.json")]
                 ready = _read_json(child)
                 folder = Path(str(ready.get("folder", "")))
-                if comp in COMPONENTS and comp != "app" and ready and folder.is_dir() and \
+                if comp in STAGED_COMPONENTS and ready and folder.is_dir() and \
                         folder.parent == stage:
                     with self._lock:
                         self._pending[comp] = ready

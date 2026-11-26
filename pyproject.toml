@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tacoguard"
-version = "0.3.0"
+version = "0.4.0"
 description = "A second-opinion malware scanner for Windows that works next to Microsoft Defender."
 readme = "README.md"
 license = "Apache-2.0"
@@ -30,7 +30,7 @@ test = ["pytest>=8"]
 include = ["tacoguard*"]
 
 [tool.setuptools.package-data]
-tacoguard = ["web/static/*", "data/*", "ml/pefile_warnings.txt", "ml/NOTICE"]
+tacoguard = ["web/static/*", "data/*", "ml/pefile_warnings.txt", "ml/NOTICE", "webblock/*.ps1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -11,6 +11,7 @@
     quickLoaded: false, setupWatch: false, timer: null, settingsLoaded: false,
     notCheckedShown: 0,
     prot: null, protTimer: null, protSig: "", p3: null,
+    dash: null, dashTimer: null, webTimer: null, settingsAnchor: "", modes: null,
   };
 
   // ---- small helpers -------------------------------------------------------------------
@@ -42,6 +43,12 @@
     if (!t) return "";
     const d = new Date(t * 1000);
     return d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  }
+  function fmtClock(t) {
+    if (!t) return "";
+    const d = new Date(t * 1000);
+    if (d.toDateString() !== new Date().toDateString()) return fmtTime(t);
+    return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
   }
   function fmtDuration(s) {
     s = Math.max(0, Math.round(s));
@@ -122,12 +129,13 @@
       if (a.dataset.view === name) a.setAttribute("aria-current", "page");
       else a.removeAttribute("aria-current");
     }
+    if (name === "home") scheduleDash(0);
     if (name === "protection") { state.protSig = ""; if (state.prot) renderProtection(state.prot); scheduleProt(0); }
     if (name === "scan") { loadQuick(); renderScan(true); }
     if (name === "detections") loadDetections();
     if (name === "quarantine") loadQuarantine();
     if (name === "trusted") loadTrusted();
-    if (name === "settings") loadSettings();
+    if (name === "settings") { state.settingsAnchor = /^(web|key|more)$/.test(arg || "") ? arg : ""; loadSettings(); }
   }
   window.addEventListener("hashchange", () => showView(location.hash.slice(1)));
 
@@ -140,6 +148,17 @@
       state.status = st;
       const up = st.updates || {};
       busy = st.busy || up.checking || !!(up.app && up.app.state && up.app.state.running);
+      const ready = !!(st.modes && st.modes.lookup_ready);
+      if (ready !== state.lookupReady) {        // the "Look up" buttons appear or go away
+        const first = state.lookupReady === undefined;
+        state.lookupReady = ready;
+        if (!first || ready) {
+          if (state.view === "detections") loadDetections();
+          if (state.view === "protection" && state.prot) { state.protSig = ""; renderProtection(state.prot); }
+          if (state.view === "scan") state.jobSig = "";
+        }
+      }
+      renderModes(st.modes);
       renderHome();
       if (state.view === "scan") await renderScan(false);
       if (st.setup.running || state.setupWatch) await refreshSetup();
@@ -166,12 +185,12 @@
     card.className = "card";
     $("protection-link").hidden = !c.open_detections;
     $("protection-rt-link").hidden = !pr.attention;
+    // (the Protection card above shows the real-time summary itself)
     const rtLine = $("protection-rt");
-    rtLine.textContent = pr.summary || "";
-    rtLine.className = "small" + (pr.state === "on" ? "" : " muted");
-    if (pr.attention) {
-      rtLine.textContent = plural(pr.attention, "alert") + " from real-time protection " + (pr.attention === 1 ? "is" : "are") + " waiting for you. " + (pr.summary || "");
-    }
+    rtLine.className = "small";
+    rtLine.textContent = pr.attention
+      ? plural(pr.attention, "alert") + " from real-time protection " + (pr.attention === 1 ? "is" : "are") + " waiting for you."
+      : "";
     if (c.open_malware) {
       card.classList.add("is-bad");
       line.textContent = "Malware found in " + plural(c.open_malware, "file") + ". You decide what to do with it.";
@@ -502,12 +521,17 @@
       actions.append(btn("Scan again", "quiet", doRescan), btn("Trust this file", "quiet", doTrust), btn("Quarantine", "warn", doQuarantine));
       if (r.action !== "confirmed") actions.append(btn("It's a threat", "link", doConfirm, "Records that you agree. TacoGuard remembers your choice."));
     }
+    if (canLookUp(r) && r.action !== "deleted") {
+      actions.append(btn("Look up", "link", () => lookUp({ result_id: r.id }, after),
+        "Asks MalwareBazaar whether it knows this exact file. Only its fingerprint (SHA-256 hash) is sent."));
+    }
     card.append(head);
     if (r.ml_score !== null && r.ml_score !== undefined) {
       card.appendChild(el("p", { class: "ml-line", text: "ML score " + Number(r.ml_score).toFixed(2) +
         (r.signature_match ? ", and a signature or rule matched too." : ", no signature match.") }));
     }
     card.append(body);
+    if (r.lookup) card.appendChild(lookupLine(r.lookup));
     if (r.action === "confirmed") card.appendChild(el("p", { class: "tag", text: "You confirmed this is a threat." }));
     const meta = [];
     if (r.path && r.path !== name) meta.push(r.path);
@@ -831,6 +855,8 @@
       fillLimits(s);
       fillPhase2(s);
       fillPhase3(s);
+      fillPhase4(s);
+      loadWeb();
       renderSigners(s.signers || []);
       loadLearned();
       const ep = clear($("endpoints"));
@@ -853,6 +879,11 @@
       const paths = clear($("paths"));
       for (const [k, v] of [["Data folder", s.data_dir], ["Quarantine", s.quarantine_dir], ["Logs", s.log_dir], ["Version", s.version]]) {
         paths.append(el("dt", { text: k }), el("dd", { class: "mono", text: v }));
+      }
+      if (state.settingsAnchor) {
+        const panel = $("panel-" + state.settingsAnchor);
+        state.settingsAnchor = "";
+        if (panel) panel.scrollIntoView({ block: "start" });
       }
     });
   }
@@ -1152,6 +1183,7 @@
         (e.signature_match ? ", and a signature or rule matched too." : ", no signature match.") }));
     }
     if (e.message) card.appendChild(el("p", { class: "reason", text: e.message }));
+    if (e.lookup) card.appendChild(lookupLine(e.lookup));
     const meta = [];
     if (e.path && e.path !== name) meta.push(e.path);
     meta.push(fmtTime(e.created));
@@ -1176,6 +1208,10 @@
         acts.append(cardBtn("Quarantine", "danger", send("quarantine")), cardBtn("Not a threat", "quiet", trust), cardBtn("Scan again", "quiet", rescan));
       } else {
         acts.append(cardBtn("Scan again", "quiet", rescan), cardBtn("Trust this file", "quiet", trust), cardBtn("Quarantine", "warn", send("quarantine")));
+      }
+      if (canLookUp(e)) {
+        acts.appendChild(cardBtn("Look up", "link", () => lookUp({ event_id: e.id }, () => { state.protSig = ""; protTick(); }),
+          "Asks MalwareBazaar whether it knows this exact file. Only its fingerprint (SHA-256 hash) is sent."));
       }
     }
     acts.appendChild(cardBtn("Dismiss", "link", send("dismiss"), "Takes it off this list. It stays in the history."));
@@ -1297,6 +1333,374 @@
       protTick(); tick();
     });
   });
+
+  // ---- Phase 4: paused protection and Game mode banners (every tab) ------------------------------
+  function renderModes(m) {
+    const box = clear($("modes"));
+    state.modes = m || null;
+    if (!m) return;
+    if (m.paused_until) {
+      box.appendChild(el("div", { class: "banner warn mode" },
+        el("span", { text: "Real-time protection is paused until " + fmtClock(m.paused_until) + ". Scans you start yourself still work." }),
+        el("button", { type: "button", class: "btn quiet", text: "Resume now", onclick: () => setPause(0) })));
+    }
+    const gm = m.game_mode || {};
+    if (gm.active) {
+      const why = gm.manual ? "You switched it on." : (gm.reason ? "TacoGuard noticed " + gm.reason + "." : "");
+      box.appendChild(el("div", { class: "banner info mode" },
+        el("span", { text: "Game mode is on. " + (why ? why + " " : "") + "Scans and update checks wait, and there are no pop-up notifications. Real-time checks keep running." }),
+        el("button", { type: "button", class: "btn quiet", text: "Turn off Game mode", onclick: () => setGame(false) })));
+    }
+  }
+  function afterModeChange(out) {
+    toast(out.message);
+    if (out.modes) renderModes(out.modes);
+    tick(); scheduleDash(0); protTick();
+  }
+  function setPause(minutes) {
+    return act(async () => afterModeChange(await api("/api/protection/pause", { minutes: minutes })));
+  }
+  function setGame(on) {
+    return act(async () => afterModeChange(await api("/api/gamemode", { on: on })));
+  }
+
+  // ---- Phase 4: the Home dashboard ---------------------------------------------------------------
+  // Polled every 10 s while Home is open and the window visible.
+  function scheduleDash(ms) { clearTimeout(state.dashTimer); state.dashTimer = setTimeout(dashTick, ms); }
+  async function dashTick() {
+    clearTimeout(state.dashTimer);
+    if (state.view !== "home") return;
+    try {
+      const d = await api("/api/dashboard");
+      state.dash = d;
+      renderDashboard(d);
+    } catch (e) { /* offline banner is shown by api() */ }
+    const hostsBusy = !!(state.dash && state.dash.webblock && state.dash.webblock.hosts &&
+      state.dash.webblock.hosts.action && state.dash.webblock.hosts.action.running);
+    if (state.view === "home") scheduleDash(hostsBusy ? 2000 : document.visibilityState === "visible" ? 10000 : 60000);
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && state.view === "home") scheduleDash(0);
+  });
+
+  function renderDashboard(d) {
+    const p = d.protection || {}, m = d.modes || {}, gm = m.game_mode || {};
+    const paused = !!m.paused_until;
+    $("dash-summary").textContent = paused
+      ? "Real-time protection is paused until " + fmtClock(m.paused_until) + ". It starts again by itself then."
+      : (p.summary || "");
+    $("dash-dot").className = "dot " + (paused ? "none" : (GUARD_DOTS[p.state] || "none"));
+    const notes = [p.note, (d.tray || {}).note].filter(Boolean);
+    $("dash-note").hidden = !notes.length;
+    $("dash-note").textContent = notes.join(" ");
+    const ul = clear($("dash-parts"));
+    for (const part of p.parts || []) {
+      const on = part.state === "on" && !paused;
+      // long notes (e.g. Windows hides its DNS cache) stay on their own card; here a short word
+      const short = part.message && part.message.length <= 60 ? part.message
+        : (part.state === "off" && part.message ? "Off" : (PART_WORDS[part.state] || part.state));
+      ul.appendChild(el("li", { title: part.message || null },
+        el("span", { class: "dot " + (on ? "ok" : part.state === "error" ? "warn" : "none") }),
+        el("span", { text: part.label + ": " }),
+        el("span", { class: "muted", text: paused && part.state === "on" ? "Paused" : short })));
+    }
+    const pb = $("btn-pause");
+    pb.hidden = !p.enabled && !paused;
+    pb.textContent = paused ? "Resume now" : "Pause for 1 hour";
+    pb.className = "btn " + (paused ? "primary" : "quiet");
+    const gb = $("btn-game");
+    gb.textContent = gm.active ? "Turn off Game mode" : "Turn on Game mode (up to 4 hours)";
+    $("dash-game-note").textContent = gm.auto
+      ? "Game mode starts by itself during full-screen games and presentations."
+      : "Game mode starts only when you switch it on (you can change this in Settings).";
+    const sp = d.self_protection || {};
+    const selfBits = [];
+    if (!sp.enabled) selfBits.push("Self-protection is off (Settings).");
+    else if (sp.hardened === false) selfBits.push("Self-protection could not be switched on for this page. TacoGuard runs anyway.");
+    else if (sp.hardened === true) selfBits.push("Self-protection is on: programs without administrator rights can't end or freeze TacoGuard by accident or on purpose; an administrator still can.");
+    else selfBits.push("Self-protection is on.");
+    for (const n of sp.notes || []) selfBits.push(n);
+    $("dash-self").textContent = selfBits.join(" ");
+    renderWebCard(d.webblock || {});
+    renderLookupCard(d.lookup || {});
+  }
+  $("btn-pause").addEventListener("click", () => {
+    const m = (state.dash && state.dash.modes) || state.modes || {};
+    setPause(m.paused_until ? 0 : 60);
+  });
+  $("btn-game").addEventListener("click", () => {
+    const m = (state.dash && state.dash.modes) || state.modes || {};
+    setGame(!(m.game_mode && m.game_mode.active));
+  });
+
+  function listLine(src) {
+    const bits = [];
+    if (src.count) bits.push(Number(src.count).toLocaleString() + " websites");
+    if (src.fetched) bits.push("downloaded " + fmtTime(src.fetched));
+    return bits.join(", ");
+  }
+  function sourceItem(src) {
+    const off = src.on === false;
+    const good = !off && src.count > 0 && !["error", "refused"].includes(src.state);
+    return el("li", {},
+      el("span", { class: "dot " + (good ? "ok" : ["error", "refused"].includes(src.state) ? "warn" : "none") }),
+      el("strong", { text: (src.label || src.name).replace(/^./, (c) => c.toUpperCase()) }), " ",
+      el("span", { text: off ? "Off (Settings)" : (src.message || (src.count ? "Ready" : "Not downloaded yet")) }),
+      !off && listLine(src) ? el("span", { class: "muted small block", text: listLine(src) }) : null);
+  }
+
+  function hostsWords(h) {
+    if (!h || !h.available) return (h && h.message) || "";
+    const a = h.action || {};
+    if (a.running) return "Waiting for your answer to Windows' administrator prompt...";
+    const p = h.plan || {};
+    if (p.message) return p.message;
+    const n = Number(p.blocked || p.in_file || p.applied_count || 0);
+    if (p.applied || p.in_place || n) {
+      return "On: " + (n ? n.toLocaleString() + " websites are" : "websites are") + " blocked in the hosts file" +
+        (p.last_applied ? " (updated " + fmtTime(p.last_applied) + ")" : "") + ".";
+    }
+    return h.enabled ? "Not in the hosts file yet." : "Not used. TacoGuard still warns you when a program contacts a bad website.";
+  }
+
+  function renderWebCard(w) {
+    const ul = clear($("web-dash-lists"));
+    let line, dot = "none";
+    if (!w.available) line = w.message || "Not available in this copy of TacoGuard.";
+    else if (!w.enabled) line = "Off. You can turn it on in Settings.";
+    else if (!w.total) line = "The website lists haven't been downloaded yet. They come with the next update check.";
+    else {
+      line = Number(w.total).toLocaleString() + " known bad websites on the lists.";
+      dot = "ok";
+    }
+    const partNote = w.enabled && w.part && w.part.message ? w.part.message : "";
+    if (w.enabled && w.part && w.part.state === "error") dot = "warn";
+    $("web-part-note").hidden = !partNote;
+    $("web-part-note").textContent = partNote;
+    $("web-line").textContent = line;
+    $("web-dot").className = "dot " + dot;
+    if (w.available && w.enabled) for (const s of w.sources || []) ul.appendChild(sourceItem(s));
+    const h = w.hosts || {}, p = h.plan || {}, a = h.action || {};
+    $("web-hosts-line").textContent = h.available
+      ? "Hosts file: " + hostsWords(h) + (!a.running && a.error ? " " + a.error : "") : "";
+    // the hosts file is the way to block in every browser (and the only one where Windows hides
+    // its DNS cache): offer it right here when it isn't in place or newer lists are waiting
+    const hb = $("btn-web-hosts");
+    if (h.available && p.offer_remove) {
+      // website blocking or the hosts block was switched off, but the block is still in the file
+      hb.dataset.mode = "remove";
+      hb.hidden = false;
+      hb.textContent = "Take TacoGuard's block out of the hosts file";
+    } else {
+      hb.dataset.mode = "apply";
+      hb.hidden = !(h.available && w.enabled && p.ready && !p.current && !p.changed_by_other);
+      hb.textContent = p.block && p.block.present ? "Update the block in every browser" : "Block in every browser";
+    }
+    hb.disabled = !!a.running;
+  }
+
+  function renderLookupCard(l) {
+    const k = l.key || {};
+    let line, dot = "none";
+    if (!l.available) line = l.message || "Not available in this copy of TacoGuard.";
+    else if (!k.set) line = "Off until you add your free abuse.ch key.";
+    else if (!l.enabled) line = "Off in Settings. Your key is saved (" + (k.hint || "key saved") + ").";
+    else { line = "On: files TacoGuard flags are looked up by their fingerprint (your key " + (k.hint || "is saved") + ")."; dot = "ok"; }
+    if (l.last_error && l.ready) dot = "warn";
+    $("lookup-line").textContent = line;
+    $("lookup-dot").className = "dot " + dot;
+    const bits = [];
+    if (l.ready && l.last_error) bits.push("Last try: " + l.last_error);
+    else if (l.ready && l.when) bits.push("Last answer " + fmtTime(l.when) + ".");
+    if (l.ready && l.left !== null && l.left !== undefined) bits.push(plural(l.left, "lookup") + " left this hour.");
+    if (k.message) bits.push(k.message);
+    $("lookup-detail").textContent = bits.join(" ");
+  }
+
+  // ---- Phase 4: MalwareBazaar lookups on result and alert cards ----------------------------------
+  function canLookUp(r) {
+    const m = state.status && state.status.modes;
+    return !!(m && m.lookup_ready) && /^[0-9a-f]{64}$/i.test(r.sha256 || "") && (r.level === "malware" || r.level === "suspicious");
+  }
+  function lookUp(which, after) {
+    return act(async () => {
+      const out = await api("/api/lookup", which);
+      toast(out.message, out.found ? "warn" : undefined);
+      if (after) after();
+    });
+  }
+  function lookupLine(l) {
+    return el("p", { class: "lookup-line small" + (l.found ? " bad-text" : "") },
+      el("span", { text: l.message + (l.checked ? " (asked " + fmtTime(l.checked) + ")" : "") + " " }),
+      el("a", { href: l.link, target: "_blank", rel: "noopener noreferrer", text: "Open on MalwareBazaar" }));
+  }
+
+  // ---- Settings: website blocking, the abuse.ch key, the other Phase 4 switches --------------------
+  const P4_WEB = ["webblock_enabled", "webblock_phishing_list", "webblock_urlhaus_list"];
+  const P4_MORE = ["lookup_enabled", "tray_enabled", "game_mode_auto", "self_protection"];
+
+  function fillPhase4(s) {
+    const w = $("web-form"), f = $("phase4-form");
+    for (const k of P4_WEB) if (w.elements[k]) w.elements[k].checked = !!s[k];
+    for (const k of P4_MORE) if (f.elements[k]) f.elements[k].checked = !!s[k];
+    w.elements.webblock_hosts_every_days.value = s.webblock_hosts_every_days;
+    w.elements.webblock_allow.value = (s.webblock_allow || []).join("\n");
+    renderKey(s.abusech_key || {});
+    syncWeb();
+  }
+  function syncWeb() {
+    const w = $("web-form");
+    const on = w.elements.webblock_enabled.checked;
+    for (const k of ["webblock_phishing_list", "webblock_urlhaus_list"]) w.elements[k].disabled = !on;
+  }
+  $("web-form").elements.webblock_enabled.addEventListener("change", syncWeb);
+
+  $("web-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const w = e.target, body = {};
+    for (const k of P4_WEB) body[k] = w.elements[k].checked;
+    if (w.elements.webblock_hosts_every_days.value !== "") body.webblock_hosts_every_days = Number(w.elements.webblock_hosts_every_days.value);
+    body.webblock_allow = w.elements.webblock_allow.value.split(/[\r\n,]+/).map((x) => x.trim()).filter(Boolean);
+    act(async () => {
+      const out = await api("/api/settings", body);
+      $("web-msg").textContent = out.message;
+      fillPhase4(out.settings);
+      loadWeb();
+      if (out.offer_hosts_remove) offerHostsRemove();
+    });
+  });
+  $("phase4-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const f = e.target, body = {};
+    for (const k of P4_MORE) body[k] = f.elements[k].checked;
+    act(async () => {
+      const out = await api("/api/settings", body);
+      $("phase4-msg").textContent = out.message;
+      fillPhase4(out.settings);
+      tick();
+    });
+  });
+
+  function renderKey(k) {
+    $("key-state").textContent = !k.available ? (k.message || "Not available in this copy of TacoGuard.")
+      : (k.set ? "A key is saved (" + (k.hint || "it can't be read") + ")." : "No key saved yet.");
+    $("key-dot").className = "dot " + (k.set && k.hint ? "ok" : "none");
+    $("key-note").hidden = !(k.available && k.message);
+    $("key-note").textContent = k.available ? (k.message || "") : "";
+    $("btn-key-remove").hidden = !k.set;
+    $("key-input").disabled = !k.available;
+    $("urlhaus-note").textContent = "Websites that spread malware, from abuse.ch. " +
+      (k.set ? "Uses your abuse.ch key." : "Needs your free abuse.ch key (below).");
+  }
+  $("key-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const input = $("key-input");
+    const value = input.value;
+    input.value = "";                      // never left on the page
+    if (!value.trim()) { toast("Paste your abuse.ch key first.", "warn"); return; }
+    act(async () => {
+      const out = await api("/api/secrets/abusech", { key: value });
+      toast(out.message);
+      renderKey({ available: true, set: out.set, hint: out.hint });
+      loadWeb(); tick();
+    });
+  });
+  $("btn-key-remove").addEventListener("click", () => act(async () => {
+    const res = await confirmBox({ title: "Remove your abuse.ch key?",
+      text: ["MalwareBazaar lookups stop, and the URLhaus list is no longer updated (the last downloaded list stays in use).",
+        "Your abuse.ch account itself is not changed. You can paste the key again any time."],
+      ok: "Remove key" });
+    if (!res.ok) return;
+    const out = await api("/api/secrets/abusech", { clear: true });
+    toast(out.message);
+    renderKey({ available: true, set: out.set, hint: out.hint });
+    loadWeb(); tick();
+  }));
+
+  // Website lists and the hosts file: polled every 2 s while an action runs and Settings is open.
+  async function loadWeb() {
+    clearTimeout(state.webTimer);
+    let w;
+    try { w = await api("/api/webblock"); } catch (e) { return; }
+    renderWebSettings(w);
+    const busy = (w.refresh && w.refresh.running) || (w.hosts && w.hosts.action && w.hosts.action.running);
+    if (busy && state.view === "settings") state.webTimer = setTimeout(loadWeb, 2000);
+  }
+  function renderWebSettings(w) {
+    const ul = clear($("web-lists"));
+    if (!w.available) ul.appendChild(el("li", { class: "muted", text: w.message || "Not available in this copy of TacoGuard." }));
+    for (const s of w.sources || []) ul.appendChild(sourceItem(s));
+    const r = w.refresh || {};
+    $("btn-web-refresh").disabled = !w.available || !w.enabled || !!r.running || !!w.busy;
+    $("web-refresh-state").textContent = r.running ? "Updating the lists..."
+      : (w.busy ? "The lists are being updated in the background right now." : (r.error || r.message || ""));
+    $("web-refresh-state").className = "small " + (r.error && !r.running ? "warn-text" : "muted");
+    const h = w.hosts || {}, a = h.action || {};
+    $("hosts-state").textContent = hostsWords(h);
+    const msg = $("hosts-action");
+    const shown = !a.running && (a.error || a.message);
+    msg.hidden = !shown;
+    msg.textContent = shown || "";
+    msg.className = "small " + (a.error ? "warn-text" : "");
+    $("btn-hosts-apply").disabled = !h.available || !!a.running;
+    $("btn-hosts-remove").disabled = !h.available || !!a.running;
+  }
+  $("btn-web-refresh").addEventListener("click", () => act(async () => {
+    const out = await api("/api/webblock/refresh", {});
+    toast(out.message);
+    loadWeb();
+  }));
+  $("btn-hosts-apply").addEventListener("click", () => applyHosts(loadWeb));
+  $("btn-web-hosts").addEventListener("click", (e) => {
+    if (e.currentTarget.dataset.mode === "remove") removeHosts(() => scheduleDash(500));
+    else applyHosts(() => scheduleDash(500));
+  });
+  function hostsHelper() {
+    const w = state.dash && state.dash.webblock;
+    const p = (w && w.hosts && w.hosts.plan) || {};
+    return p.helper || {};
+  }
+  // The text the confirm box shows the first time (and after an update of TacoGuard's helper).
+  function firstUseText(helper) {
+    const where = helper.dir || "C:\\Program Files\\TacoGuard";
+    return "The first time, Windows' prompt shows \"Windows PowerShell\" (made by Microsoft): TacoGuard installs a small helper into " +
+      where + ", a folder only administrators can change. After that, each update is one prompt for that helper.";
+  }
+  async function applyHostsNow(after, helper) {
+    const text = ["Windows asks for administrator permission first. TacoGuard's helper then keeps a copy of the original hosts file (once), writes TacoGuard's own marked section and clears Windows' memory of website addresses.",
+      "Each line sends one bad website to 0.0.0.0 (nowhere). Lines that aren't TacoGuard's stay as they are."];
+    if (helper.first_use) text.push(firstUseText(helper));
+    text.push("If Microsoft Defender warns about the hosts file, follow what Defender says. TacoGuard tells you if its block was taken out. You can take the block out any time with Remove TacoGuard's block (Settings).");
+    const res = await confirmBox({ title: "Block these websites in every browser?", text: text, ok: "Continue" });
+    if (!res.ok) return;
+    const out = await api("/api/webblock/hosts", { action: "apply" });
+    toast(out.message);
+    after();
+  }
+  function applyHosts(after) {
+    return act(async () => {
+      let helper = hostsHelper();
+      try { const w = await api("/api/webblock"); helper = (w.hosts && w.hosts.plan && w.hosts.plan.helper) || helper; } catch (e) { /* keep what the dashboard said */ }
+      await applyHostsNow(after, helper);
+    });
+  }
+  function removeHosts(after) {
+    return act(async () => {
+      const res = await confirmBox({ title: "Take TacoGuard's block out of the hosts file?",
+        text: ["Windows asks for administrator permission again. Only TacoGuard's marked section is removed; the rest of the file stays as it is.",
+          "TacoGuard's warnings about bad websites keep working while website blocking is on."],
+        ok: "Continue" });
+      if (!res.ok) return;
+      const out = await api("/api/webblock/hosts", { action: "remove" });
+      toast(out.message);
+      after();
+    });
+  }
+  // after Settings switched website blocking (or the hosts block) off while the block is still in the file
+  function offerHostsRemove() {
+    return removeHosts(loadWeb);
+  }
+  $("btn-hosts-remove").addEventListener("click", () => removeHosts(loadWeb));
 
   // ---- start -----------------------------------------------------------------------------------
   showView(location.hash.slice(1) || "home");

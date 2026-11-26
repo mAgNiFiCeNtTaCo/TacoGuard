@@ -27,13 +27,27 @@
 <div id="offline" class="banner bad" hidden>TacoGuard's page lost contact with the program. Is the TacoGuard window still open?</div>
 
 <main>
+  <div id="modes" class="modes" aria-live="polite"></div>
   <!-- HOME -->
   <section id="view-home" class="view" hidden>
     <h1>Home</h1>
     <div id="notes"></div>
     <div class="cards">
-      <article class="card" id="card-protection">
+      <article class="card wide" id="card-status">
         <h2>Protection</h2>
+        <p class="lead"><span class="dot" id="dash-dot"></span><span id="dash-summary">Loading...</span></p>
+        <p class="small warn-text" id="dash-note" hidden></p>
+        <ul class="parts" id="dash-parts"></ul>
+        <div class="actions">
+          <button type="button" class="btn quiet" id="btn-pause" hidden>Pause for 1 hour</button>
+          <button type="button" class="btn quiet" id="btn-game">Turn on Game mode (up to 4 hours)</button>
+          <a class="btn quiet" href="#protection">Open Protection</a>
+        </div>
+        <p class="muted small" id="dash-game-note"></p>
+        <p class="muted small" id="dash-self"></p>
+      </article>
+      <article class="card" id="card-protection">
+        <h2>Waiting for you</h2>
         <p class="lead" id="protection-line">Loading...</p>
         <p class="muted" id="protection-detail"></p>
         <p class="small" id="protection-rt"></p>
@@ -41,11 +55,37 @@
           <a class="btn quiet" href="#detections" id="protection-link" hidden>See detections</a>
           <a class="btn quiet" href="#protection" id="protection-rt-link" hidden>Open Protection</a></div>
       </article>
+      <article class="card" id="card-lastscan">
+        <h2>Last scan</h2>
+        <div id="lastscan-body"><p class="muted">No scans yet.</p></div>
+      </article>
+      <article class="card" id="card-web">
+        <h2>Website blocking</h2>
+        <p class="lead"><span class="dot" id="web-dot"></span><span id="web-line">Loading...</span></p>
+        <p class="muted small" id="web-part-note" hidden></p>
+        <ul class="sig-list" id="web-dash-lists"></ul>
+        <p class="small" id="web-hosts-line"></p>
+        <div class="actions">
+          <button type="button" class="btn primary" id="btn-web-hosts" hidden>Block in every browser</button>
+          <a class="btn quiet" href="#settings/web">Website blocking settings</a></div>
+      </article>
+      <article class="card" id="card-lookup">
+        <h2>MalwareBazaar lookups</h2>
+        <p class="lead"><span class="dot" id="lookup-dot"></span><span id="lookup-line">Loading...</span></p>
+        <p class="muted small" id="lookup-detail"></p>
+        <div class="actions"><a class="btn quiet" href="#settings/key">abuse.ch key settings</a></div>
+      </article>
       <article class="card" id="card-defender">
         <h2>Microsoft Defender</h2>
         <p class="lead"><span class="dot" id="defender-dot"></span><span id="defender-line">Checking...</span></p>
         <p class="muted" id="defender-advice"></p>
         <p class="muted small" id="defender-detail"></p>
+      </article>
+      <article class="card" id="card-quarantine">
+        <h2>Quarantine</h2>
+        <p class="lead" id="quarantine-line">-</p>
+        <p class="muted small" id="quarantine-note"></p>
+        <div class="actions"><a class="btn quiet" href="#quarantine">Open quarantine</a></div>
       </article>
       <article class="card wide" id="card-signatures">
         <h2>Signatures and rules</h2>
@@ -71,16 +111,6 @@
           <button type="button" class="btn quiet" id="btn-check-updates">Check for updates</button>
           <span class="muted small" id="updates-check-state"></span>
         </div>
-      </article>
-      <article class="card" id="card-lastscan">
-        <h2>Last scan</h2>
-        <div id="lastscan-body"><p class="muted">No scans yet.</p></div>
-      </article>
-      <article class="card" id="card-quarantine">
-        <h2>Quarantine</h2>
-        <p class="lead" id="quarantine-line">-</p>
-        <p class="muted small" id="quarantine-note"></p>
-        <div class="actions"><a class="btn quiet" href="#quarantine">Open quarantine</a></div>
       </article>
     </div>
     <p class="muted small footer-note">Data folder: <span id="data-dir"></span></p>
@@ -275,6 +305,78 @@
           <input type="number" name="realtime_max_file_size" min="1" max="4096" step="1"></label>
         <div class="actions"><button type="submit" class="btn">Save</button>
           <span class="small" id="phase3-msg"></span></div>
+      </form>
+    </div>
+    <div class="panel" id="panel-web">
+      <h2>Website blocking</h2>
+      <p class="muted">TacoGuard keeps two lists of known bad websites and warns you when this PC looks one up or a program connects to one. It only warns: it never pauses or ends a program for a website. Microsoft Defender's own SmartScreen keeps working as before.</p>
+      <form id="web-form" class="limits" autocomplete="off">
+        <label class="check wide"><input type="checkbox" name="webblock_enabled">
+          <span>Website blocking
+            <span class="unit block">Downloads the lists with the other updates and checks the website names this PC looks up (no admin rights).</span></span></label>
+        <label class="check wide"><input type="checkbox" name="webblock_phishing_list">
+          <span>Phishing website list
+            <span class="unit block">Phishing.Database's list of active phishing websites (fake login and payment pages). No key needed.</span></span></label>
+        <label class="check wide"><input type="checkbox" name="webblock_urlhaus_list">
+          <span>URLhaus malware website list
+            <span class="unit block" id="urlhaus-note">Websites that spread malware, from abuse.ch. Needs your free abuse.ch key (below).</span></span></label>
+        <label class="wide"><span>Never block or warn about these websites
+            <span class="unit block">One per line, like example.com (its subdomains count too). Use it for a site you trust that a list got wrong. Up to 500.</span></span>
+          <textarea name="webblock_allow" rows="3" spellcheck="false" autocomplete="off" placeholder="example.com"></textarea></label>
+        <div class="wide folder-group">
+          <h3>Website lists</h3>
+          <ul class="sig-list" id="web-lists"></ul>
+          <div class="actions">
+            <button type="button" class="btn quiet" id="btn-web-refresh">Update the lists now</button>
+            <span class="muted small" id="web-refresh-state"></span>
+          </div>
+        </div>
+        <div class="wide folder-group" id="hosts-group">
+          <h3>Block in every browser (hosts file)</h3>
+          <p class="unit">Windows' hosts file can send these websites nowhere, in every browser and program. Changing it needs administrator rights, so Windows asks you each time (a prompt from Windows, not from TacoGuard). The first time, the prompt shows "Windows PowerShell" and TacoGuard installs a small helper into Program Files\TacoGuard, a folder only administrators can change. TacoGuard writes only its own marked section, keeps a copy of the original file once, and never lists Microsoft's or other important websites.</p>
+          <p class="small" id="hosts-state">Checking...</p>
+          <p class="small" id="hosts-action" hidden></p>
+          <div class="actions">
+            <button type="button" class="btn quiet" id="btn-hosts-apply">Block in the hosts file</button>
+            <button type="button" class="btn quiet" id="btn-hosts-remove">Remove TacoGuard's block</button>
+          </div>
+          <label class="days"><span>Offer an update of the block at most every <span class="unit">(days, 1 to 30)</span></span>
+            <input type="number" name="webblock_hosts_every_days" min="1" max="30" step="1"></label>
+        </div>
+        <div class="actions"><button type="submit" class="btn">Save</button>
+          <span class="small" id="web-msg"></span></div>
+      </form>
+    </div>
+    <div class="panel" id="panel-key">
+      <h2>Your abuse.ch key</h2>
+      <p class="muted">abuse.ch is a non-profit project that tracks malware and the websites that spread it. Its key is free for personal, non-commercial use: sign in at <a href="https://auth.abuse.ch/" target="_blank" rel="noopener noreferrer">auth.abuse.ch</a>, copy your Auth-Key and paste it here. TacoGuard then looks up files it flagged on MalwareBazaar (it sends only the file's fingerprint, never the file) and downloads the URLhaus list.</p>
+      <p class="lead"><span class="dot" id="key-dot"></span><span id="key-state">Checking...</span></p>
+      <p class="small warn-text" id="key-note" hidden></p>
+      <form id="key-form" class="row" autocomplete="off">
+        <label for="key-input" class="sr-only">abuse.ch Auth-Key</label>
+        <input id="key-input" type="password" placeholder="Paste your abuse.ch Auth-Key" spellcheck="false" autocomplete="off">
+        <button type="submit" class="btn">Save key</button>
+        <button type="button" class="btn quiet" id="btn-key-remove" hidden>Remove key</button>
+      </form>
+      <p class="muted small">The key is kept encrypted for your Windows account only. This page never shows it again, only its last 4 characters.</p>
+    </div>
+    <div class="panel" id="panel-more">
+      <h2>Lookups, taskbar icon, Game mode and self-protection</h2>
+      <form id="phase4-form" class="limits" autocomplete="off">
+        <label class="check wide"><input type="checkbox" name="lookup_enabled">
+          <span>Look up flagged files on MalwareBazaar
+            <span class="unit block">Only files TacoGuard flagged, and only with your abuse.ch key. When MalwareBazaar knows the exact file under a malware name and the file has no valid digital signature, the result becomes malware; a copy without a name, or of a signed file, counts as a weaker match. When it doesn't know the file, nothing changes. At most 30 lookups an hour.</span></span></label>
+        <label class="check wide"><input type="checkbox" name="tray_enabled">
+          <span>Show the TacoGuard icon in the taskbar
+            <span class="unit block">Next to the clock: green when all is well, orange when something needs you, grey while protection is paused or off. Right-click it to pause, start Game mode or quit.</span></span></label>
+        <label class="check wide"><input type="checkbox" name="game_mode_auto">
+          <span>Start Game mode by itself during full-screen games and presentations
+            <span class="unit block">Scans wait, update checks wait and TacoGuard shows no pop-up notifications. Real-time checks keep running. If you turn Game mode off during a game, TacoGuard leaves it off for 2 hours.</span></span></label>
+        <label class="check wide"><input type="checkbox" name="self_protection">
+          <span>Self-protection
+            <span class="unit block">Programs without administrator rights can't end or freeze TacoGuard by accident or on purpose; an administrator still can. Quit it from the taskbar icon or from this page. TacoGuard also tells you when its own files or start-up entry are changed.</span></span></label>
+        <div class="actions"><button type="submit" class="btn">Save</button>
+          <span class="small" id="phase4-msg"></span></div>
       </form>
     </div>
     <div class="panel">

@@ -673,7 +673,7 @@ def test_background_thread_checks_at_start_and_stops(settings, store, release, o
     assert st["last_check"] and st["next_check"] > st["last_check"]
     assert ml_version_on_disk(settings) == "1.0"
     assert (Path(settings.log_dir) / "updates.log").exists()
-    assert set(st["components"]) == {"clamav_signatures", "yara_rules", "ml_model", "app"}
+    assert set(st["components"]) == {"clamav_signatures", "yara_rules", "ml_model", "app", "web_lists"}
     for comp in st["components"].values():
         assert set(comp) >= {"version", "updated", "state", "message", "last_error"}
 

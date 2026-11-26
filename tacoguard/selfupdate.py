@@ -11,7 +11,8 @@ How an update goes (install_update, in the running page's process):
   1. refuse when not installed, when a scan runs, or when another update is under way;
   2. verify the package again against its signed target entry (tacoguard.updates.signed);
   3. unpack it to versions/<new>.staging (no paths outside it, no links, size limits);
-  4. its requirements.lock must equal the installed one (else: run the installer again);
+  4. its requirements.lock must equal the installed one (else: run the installer again); the hash
+     list tacoguard-files.json is written from the unpacked files (Phase 4, selfprotect.py);
   5. versions/<new>: `python -m tacoguard selftest` must pass, else it is deleted and nothing changes;
   6. current.json -> {"version": new, "previous": old, "pending": true, "pending_since": epoch,
      "pending_from": old, "pending_mode": "update" | "rollback", "watchdog_pid": pid};
@@ -432,6 +433,15 @@ def _switch_and_restart(settings, root: Path, mode: str, old: str, new: str, pre
         t.start()
 
 
+def _write_manifest(root: Path, old: str, staging: Path) -> None:
+    """Phase 4: the hash list of the new version (tacoguard/selfprotect.py), made from the files
+    just unpacked from the verified package. The launcher is not part of a package, so its
+    hash is carried over from the running version's list (when it has one)."""
+    from .selfprotect import read_manifest, write_manifest
+    old_list = read_manifest(root / "versions" / old) or {}
+    write_manifest(staging, launcher_sha256=old_list.get("launcher"))
+
+
 def previous_after_rollback(root: Path, version: str) -> str | None:
     """What 'previous' should be once we are back on `version`: the newest other installed
     version that is older than it (so 'Go back' never offers the version that just failed)."""
@@ -480,6 +490,7 @@ def install_update(settings, version: str, shutdown=None, *, _server_pid: int | 
         have_lock = (root / LOCK_NAME).read_text(encoding="utf-8") if (root / LOCK_NAME).is_file() else ""
         if not same_lock(new_lock, have_lock):
             raise Refused(NEW_PARTS_MSG)
+        _write_manifest(root, old, staging)
         if final.exists():
             rmtree(final)               # a leftover of an earlier failed try (never current: it's newer)
         os.replace(staging, final)
@@ -666,6 +677,14 @@ def _wait_exit(pid: int, wait_s: float, log) -> None:
     try:
         p.terminate()
         p.wait(10)
+    except psutil.AccessDenied:
+        # self-protection (tacoguard/selfprotect.py): without admin rights it can't be ended from
+        # here; give it a little longer to close by itself
+        log(f"the old page (pid {pid}) is protected and could not be ended; waiting {wait_s:.0f} s more")
+        try:
+            p.wait(wait_s)
+        except psutil.Error:
+            pass
     except psutil.Error:
         pass
 

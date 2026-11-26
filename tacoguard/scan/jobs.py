@@ -35,6 +35,9 @@ from . import walker
 HEARTBEAT_S = 5
 STALE_S = 30
 INTERRUPTED_MSG = "Stopped when the app closed. Press Resume to carry on."
+HUNG_S = 10 * 60               # no heartbeat this long from a worker TacoGuard can't end: hung
+HUNG_MSG = ("A scan helper stopped answering; restart Windows to clear it. New scans can start "
+            "meanwhile, and Resume carries on with this one.")
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -84,32 +87,57 @@ def resume_scan(settings, store, job_id: int) -> None:
 def recover_interrupted(store) -> list[int]:
     """Running jobs whose worker is gone become 'interrupted'. Queued jobs too, unless a live
     worker is still running (it will start them when it finishes)."""
-    ids, live = [], False
+    ids, live, hung = [], False, set()
     for job in store.active_jobs():
         if job["status"] == "running":
-            if _worker_alive(job):
+            state = _worker_state(job)
+            if state == "alive":
                 live = True
                 continue
+            if state == "hung":
+                hung.add(job["id"])
             ids.append(job["id"])
     if not live:
         ids += [j["id"] for j in store.active_jobs() if j["status"] == "queued"]
     for job_id in ids:
-        store.update_job(job_id, status="interrupted", current="", message=INTERRUPTED_MSG)
+        store.update_job(job_id, status="interrupted", current="",
+                         message=HUNG_MSG if job_id in hung else INTERRUPTED_MSG)
     return ids
 
 
-def _worker_alive(job: dict) -> bool:
-    """A fresh heartbeat with a living pid is alive. A stale heartbeat is alive too when the pid
-    is still this job's own worker: a busy PC can starve a low-priority worker for a long time,
-    and calling that 'interrupted' would start a second worker on the same job. Only a dead pid,
-    or a pid Windows has since given to another program, makes the job interrupted."""
-    fresh = time.time() - (job["heartbeat"] or 0) <= STALE_S
+def worker_protected(pid: int) -> bool:
+    """True when Windows won't let TacoGuard end the worker (self-protection hardened it and this
+    process holds no handle opened before that)."""
+    try:
+        from ..selfprotect import ERROR_ACCESS_DENIED, PROCESS_TERMINATE, can_open
+        opened, err = can_open(pid, PROCESS_TERMINATE)
+        return not opened and err == ERROR_ACCESS_DENIED
+    except Exception:
+        return False
+
+
+def _worker_state(job: dict) -> str:
+    """"alive", "gone" or "hung". A fresh heartbeat with a living pid is alive. A stale heartbeat
+    is alive too when the pid is still this job's own worker: a busy PC can starve a low-priority
+    worker for a long time, and calling that 'interrupted' would start a second worker on the same
+    job. A dead pid, or a pid Windows has since given to another program, is gone. A worker whose
+    heartbeat (written by its own thread every 5 s) is older than HUNG_S and that TacoGuard can't
+    end (self-protection) is hung: it would otherwise block every new scan until Windows restarts."""
+    age = time.time() - (job["heartbeat"] or 0)
     if not job["pid"]:
-        return fresh    # just claimed, the worker is starting
+        return "alive" if age <= STALE_S else "gone"    # just claimed, the worker is starting
     import psutil
-    if fresh:
-        return psutil.pid_exists(job["pid"])
-    return is_job_worker(job["pid"], job["id"], job["heartbeat"] or job["started"] or 0)
+    if age <= STALE_S:
+        return "alive" if psutil.pid_exists(job["pid"]) else "gone"
+    if not is_job_worker(job["pid"], job["id"], job["heartbeat"] or job["started"] or 0):
+        return "gone"
+    if age > HUNG_S and worker_protected(job["pid"]):
+        return "hung"
+    return "alive"
+
+
+def _worker_alive(job: dict) -> bool:
+    return _worker_state(job) == "alive"
 
 
 def is_job_worker(pid: int, job_id: int, seen_at: float) -> bool:
@@ -153,8 +181,12 @@ def _claim_next(store) -> int | None:
 
 def _clear_dead_running(store) -> None:
     for job in store.active_jobs():
-        if job["status"] == "running" and not _worker_alive(job):
-            store.update_job(job["id"], status="interrupted", current="", message=INTERRUPTED_MSG)
+        if job["status"] != "running":
+            continue
+        state = _worker_state(job)
+        if state != "alive":
+            store.update_job(job["id"], status="interrupted", current="",
+                             message=HUNG_MSG if state == "hung" else INTERRUPTED_MSG)
 
 
 def start_next_queued(settings, store) -> int | None:

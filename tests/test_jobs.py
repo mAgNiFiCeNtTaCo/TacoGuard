@@ -172,6 +172,49 @@ def test_starved_worker_with_stale_heartbeat_is_still_alive(settings, store, tmp
     assert jobs.recover_interrupted(store) == []
 
 
+def _hardened_fake_worker(job_id: int) -> subprocess.Popen:
+    """Like _fake_worker, but it hardens itself (self-protection): this test can't open it anew
+    to end it; only its own Popen handle (opened before) still can."""
+    base = getattr(sys, "_base_executable", None) or sys.executable
+    root = str(Path(__file__).resolve().parents[1])
+    code = (f"import sys, time; sys.path.insert(0, {root!r}); from tacoguard import selfprotect; "
+            "print(selfprotect.harden_process(), flush=True); time.sleep(60)")
+    return subprocess.Popen([base, "-c", code, "tacoguard.scan.worker", "--job", str(job_id)],
+                            stdout=subprocess.PIPE, text=True, creationflags=0x08000000)
+
+
+def test_hung_worker_that_cannot_be_ended_doesnt_block_new_scans(settings, store, tmp_path, launches,
+                                                                 monkeypatch):
+    monkeypatch.setattr(jobs, "STALE_S", 0.5)
+    monkeypatch.setattr(jobs, "HUNG_S", 1.5)
+    job_id = store.create_job([str(tmp_path)])
+    proc = _hardened_fake_worker(job_id)
+    plain = _fake_worker(job_id + 1000)
+    try:
+        assert proc.stdout.readline().strip() == "True"
+        assert jobs.worker_protected(proc.pid) and not jobs.worker_protected(plain.pid)
+        store.update_job(job_id, status="running", pid=proc.pid, heartbeat=time.time(), started=time.time())
+        time.sleep(0.8)
+        assert jobs._worker_state(store.get_job(job_id)) == "alive"          # stale, but not for long yet
+        time.sleep(1.0)
+        assert jobs._worker_state(store.get_job(job_id)) == "hung"
+        new = jobs.start_scan(settings, store, [str(tmp_path)])             # a new scan can start
+        assert launches == [new] and store.get_job(new)["status"] == "running"
+        old = store.get_job(job_id)
+        assert old["status"] == "interrupted" and old["message"] == jobs.HUNG_MSG
+        assert "restart Windows to clear it" in jobs.HUNG_MSG
+        # a stale worker TacoGuard CAN end (not hardened) is still just starved: left alone
+        other = store.create_job([str(tmp_path)])
+        store.update_job(new, status="done")
+        store.update_job(other, status="running", pid=plain.pid, heartbeat=time.time() - 120, started=time.time())
+        monkeypatch.setattr(jobs, "is_job_worker", lambda pid, jid, seen: True)
+        assert jobs._worker_state(store.get_job(other)) == "alive"
+    finally:
+        for p in (proc, plain):
+            p.kill()                                        # our own handles still may
+            p.wait(10)
+
+
 def test_reused_pid_with_stale_heartbeat_is_interrupted(settings, store, tmp_path):
     job_id = store.create_job([str(tmp_path)])
     proc = _fake_worker(job_id)                            # started AFTER the job's last heartbeat

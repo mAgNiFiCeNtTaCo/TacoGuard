@@ -3,7 +3,9 @@
     python -m tacoguard.scan.worker --data DIR --job N
 
 The worker runs at low priority (lower_priority) and inside a Windows job object that caps its
-memory at 2 GB (limit_memory); programs it starts leave that job.
+memory at 2 GB (limit_memory); programs it starts leave that job. Phase 4: with
+settings.self_protection it hardens itself (tacoguard/selfprotect.py): other programs without
+admin rights can't end or pause it; Pause / Cancel go through the store as before.
 
 TEST ONLY: the environment variable TACOGUARD_TEST_DETECTORS=<module>:<function> makes the worker
 use fake detectors from function(settings, store) instead of the real ones. Nothing else reads it,
@@ -124,6 +126,11 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings(args.data)
     lower_priority(settings.scan_priority)
     limit_memory()
+    try:
+        from ..selfprotect import maybe_harden     # Phase 4: only admins may end / change it
+        maybe_harden(settings)
+    except Exception:
+        pass
     store = Store(settings.db_path)
     store.update_job(args.job, pid=os.getpid(), heartbeat=time.time())
     try:

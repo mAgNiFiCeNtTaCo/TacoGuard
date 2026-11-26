@@ -133,7 +133,10 @@ def in_onedrive(path: str) -> bool:
 
 
 def _label(folder: str) -> str:
-    return Path(winpath.to_display(folder)).name or winpath.to_display(folder)
+    p = Path(winpath.to_display(folder))
+    if p.name and p.parent == Path(p.anchor):          # D:\Downloads -> "Downloads (D:)"
+        return f"{p.name} ({p.drive})"
+    return p.name or winpath.to_display(folder)
 
 
 def canary_folders(settings) -> tuple[list[str], list[str]]:

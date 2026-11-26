@@ -47,12 +47,18 @@ asks for exactly that: the rule's author and source stay visible.
 | typing_extensions | Needed by signify | PSF-2.0 | https://github.com/python/typing_extensions |
 | MurmurHash3 (Austin Appleby), as used by scikit-learn's FeatureHasher | Re-written in `tacoguard/ml/_hashing.py` (scikit-learn itself is not used) | Public domain (MurmurHash3); scikit-learn BSD-3-Clause | https://github.com/aappleby/smhasher |
 
-## Planned for later phases (not used yet)
+## Used in Phase 4: MalwareBazaar hash lookup
 
-| What | For | License / terms |
-|---|---|---|
-| Phishing.Database | Phase 4 phishing domain blocking | MIT |
-| abuse.ch URLhaus, MalwareBazaar | Phase 4 opt-in lookups with your own free key | Free for personal, non-profit use; data may not be re-hosted or used to train AI models |
+| What | Used for | License / terms | Where it comes from |
+|---|---|---|---|
+| MalwareBazaar (abuse.ch, run with Spamhaus) | Looks up the SHA-256 fingerprint of a file TacoGuard already flagged, and of a file you press **Look up** for, to see whether it is known malware. Only works after you paste your own free abuse.ch key in Settings | abuse.ch Terms of Use: free for not-for-profit use by signed-in users, within abuse.ch's usage limits; commercial users may need a paid Spamhaus subscription. The data may not be used to train or improve AI models, and TacoGuard does not use it that way. TacoGuard sends only the file's SHA-256 hash and your key (never the file, its name or its contents), asks at most 30 times an hour and keeps answers for 7 days (1 day for "not known"). Checked 2026-11-26 | https://bazaar.abuse.ch, terms: https://abuse.ch/terms-of-use/ |
+
+## Used in Phase 4: website blocking
+
+| What | Used for | License / terms | Where it comes from |
+|---|---|---|---|
+| Phishing.Database (Mitchell Krog and contributors) | The list of active phishing websites ("phishing-domains-ACTIVE"): TacoGuard warns when this PC visits one, and blocks them in Windows' hosts file if you turn that on. Downloaded from phish.co.za at most every 30 minutes (with the regular update check), checked, then kept in the data folder | MIT | https://github.com/Phishing-Database/Phishing.Database, list: https://phish.co.za/latest/phishing-domains-ACTIVE.txt |
+| URLhaus (abuse.ch, run with Spamhaus) | The list of websites that spread malware: TacoGuard warns (and pauses a program that isn't a browser) when one is contacted, and blocks them in the hosts file if you turn that on. Only works after you paste your own free abuse.ch key in Settings | abuse.ch Terms of Use: free for not-for-profit use with your own key, within abuse.ch's limits (TacoGuard downloads at most every 30 minutes; abuse.ch asks for no more than every 5). The data may not be used to train or improve AI models, and TacoGuard does not use it that way. It is not re-hosted: each user's own copy of TacoGuard downloads it with that user's key. Checked 2026-11-26 | https://urlhaus.abuse.ch, terms: https://abuse.ch/terms-of-use/ |
 
 ## Looked at and not used
 

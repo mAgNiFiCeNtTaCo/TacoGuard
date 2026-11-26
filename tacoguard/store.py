@@ -138,6 +138,13 @@ CREATE TABLE IF NOT EXISTS paused (         -- programs TacoGuard paused (suspen
     updated REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS lookups (        -- Phase 4: MalwareBazaar answers, cached (tacoguard/lookup.py)
+    sha256 TEXT PRIMARY KEY,
+    found INTEGER NOT NULL,             -- 1 = known to MalwareBazaar, 0 = not known
+    data TEXT NOT NULL DEFAULT '{}',    -- JSON: signature, file_type, first_seen, tags (from the answer)
+    checked REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS persistence (    -- start-up entries: the baseline and what changed
     key TEXT PRIMARY KEY,               -- stable id, e.g. "run:HKCU:Software\\...\\Run:Name"
     source TEXT NOT NULL,               -- run|runonce|startup_folder|task|service|winlogon|ifeo|...
@@ -537,6 +544,18 @@ class Store:
         args = [fields[k] for k in fields if k in allowed]
         self._con().execute(f"UPDATE persistence SET {', '.join(sets + ['last_seen=?'])} WHERE key=?",
                             (*args, now, key))
+
+    # ---- Phase 4: MalwareBazaar lookup cache --------------------------------------------------
+    def get_lookup(self, sha256: str) -> dict | None:
+        r = self._one("SELECT * FROM lookups WHERE sha256=?", (sha256.lower(),))
+        if r:
+            r["data"] = json.loads(r["data"] or "{}")
+            r["found"] = bool(r["found"])
+        return r
+
+    def put_lookup(self, sha256: str, found: bool, data: dict | None = None) -> None:
+        self._con().execute("INSERT OR REPLACE INTO lookups(sha256, found, data, checked) VALUES(?,?,?,?)",
+                            (sha256.lower(), int(bool(found)), json.dumps(data or {}), time.time()))
 
     def delete_persistence(self, key: str) -> None:
         self._con().execute("DELETE FROM persistence WHERE key=?", (key,))

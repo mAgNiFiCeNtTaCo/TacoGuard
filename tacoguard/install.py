@@ -10,7 +10,9 @@ Layout of config.install_root() (%LOCALAPPDATA%\\Programs\\TacoGuard):
     venv\\                     Python made from the same base interpreter as the one running the
                               installer, with exactly the parts listed in requirements.lock
     requirements.lock         name==version of every part TacoGuard needs (pinned to the project's .venv)
-    versions\\<version>\\       tacoguard\\ package (no tests, no __pycache__), licences, requirements.lock
+    versions\\<version>\\       tacoguard\\ package (no tests, no __pycache__), licences, requirements.lock,
+                              tacoguard-files.json (Phase 4: sha256 of every file + the launcher,
+                              checked by the page at start, tacoguard/selfprotect.py)
     current.json              {"version": "...", "previous": "..."}, switched with os.replace
     TacoGuard.pyw             launcher: reads current.json, runs `-m tacoguard serve` from that version
     TacoGuard.cmd             the same launcher in a console window (for `version`, `selftest`, ...)
@@ -475,11 +477,14 @@ def installed_copy_running(root: Path | None = None) -> bool:
         if p.info["pid"] == me or not (p.info["name"] or "").lower().startswith("python"):
             continue
         try:
-            cwd = os.path.normcase(p.cwd())
             cmd = os.path.normcase(" ".join(p.cmdline()))
         except (psutil.Error, OSError):
             continue
-        if cwd.startswith(versions) or venv in cmd:
+        try:
+            cwd = os.path.normcase(p.cwd())
+        except (psutil.Error, OSError):
+            cwd = ""        # a hardened TacoGuard process (selfprotect.py) hides its folder
+        if cwd.startswith(versions) or venv in cmd or versions in cmd:
             if "tacoguard" in cmd:
                 return True
     return False
@@ -566,10 +571,15 @@ def _pip_parts(root: Path, lock_file: Path, progress) -> None:
                            + "\nYou can also run the installer with --offline to copy them from the project's .venv.")
 
 
-def _write_launchers(root: Path, project_root: Path) -> None:
+def _launcher_source(project_root: Path) -> Path:
     src = Path(project_root) / "tools" / LAUNCHER
     if not src.is_file():
         src = Path(__file__).resolve().parents[1] / "tools" / LAUNCHER
+    return src
+
+
+def _write_launchers(root: Path, project_root: Path) -> None:
+    src = _launcher_source(project_root)
     if not src.is_file():
         raise InstallError(f"The launcher template tools\\{LAUNCHER} is missing from the project folder.")
     shutil.copyfile(src, root / LAUNCHER)
@@ -773,6 +783,10 @@ def install(settings, project_root, shortcut: bool = False, *, deps: str = "pip"
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
         (staging / LOCK_NAME).write_text(lock, encoding="utf-8")
+        # Phase 4: the hash list the page compares the running copy with (selfprotect.check_install);
+        # the same files give the same list, so an unchanged version still counts as installed
+        from .selfprotect import write_manifest
+        write_manifest(staging, launcher=_launcher_source(project_root))
         final = vroot / version
         if final.is_dir() and tree_digest(final) == tree_digest(staging):
             rmtree(staging)
@@ -825,11 +839,42 @@ def install(settings, project_root, shortcut: bool = False, *, deps: str = "pip"
     return {"ok": True, "message": msg, "root": str(root), "version": version, "changed": changed}
 
 
+def hosts_remove_command() -> str:
+    """The exact command that takes TacoGuard's hosts-file block out later (run in the project
+    folder, with the Python that is running this)."""
+    return f'"{sys.executable}" -m tacoguard hosts remove'
+
+
+def remove_hosts_leftover(settings, *, launcher=None, hosts_path=None) -> str:
+    """For uninstall: when TacoGuard's block is in Windows' hosts file, take it out (ONE admin
+    prompt through the hosts helper, which is removed from Program Files afterwards). Returns a
+    plain sentence ("" when there was no block). Never raises."""
+    try:
+        from .webblock import hosts
+        path = hosts_path if hosts_path is not None else hosts.default_hosts_path()
+        block = hosts.read_block(path)
+        if not block["present"]:
+            return ""
+        res = hosts.remove_elevated(settings, launcher=launcher, hosts_path=path, cleanup=True)
+        if getattr(res, "ok", False):
+            return "TacoGuard's block was taken out of Windows' hosts file."
+        if getattr(res, "code", "") == "cancelled":
+            return ("TacoGuard's block is still in Windows' hosts file (you said No to Windows' prompt). "
+                    "To take it out later, run this in TacoGuard's project folder: " + hosts_remove_command())
+        return (f"TacoGuard's block is still in Windows' hosts file: {res} To take it out later, run this "
+                "in TacoGuard's project folder: " + hosts_remove_command())
+    except Exception:
+        return ("TacoGuard couldn't check Windows' hosts file for its block. To take it out later, run this "
+                "in TacoGuard's project folder: " + hosts_remove_command())
+
+
 def uninstall(settings, *, root: Path | None = None, cleanup: bool | None = None,
-              autostart_key: str | None = None) -> dict:
+              autostart_key: str | None = None, hosts_launcher=None, hosts_path=None) -> dict:
     """Remove the installed copy: only a folder carrying TacoGuard's marker, never the data
     folder or quarantine. cleanup (None = only for the default install folder) also removes the
-    start-at-sign-in entry and the guard's decoy files. Returns {"ok", "message"}."""
+    start-at-sign-in entry, the guard's decoy files and TacoGuard's block in Windows' hosts file
+    (one admin prompt; when you say No, the message gives the command for later). Returns
+    {"ok", "message"}."""
     if cleanup is None:
         cleanup = root is None
     root = Path(root or install_root())
@@ -852,6 +897,10 @@ def uninstall(settings, *, root: Path | None = None, cleanup: bool | None = None
         except OSError:
             pass
     notes = remove_guard_leftovers(settings, root, key_path=autostart_key) if cleanup else []
+    if cleanup:
+        note = remove_hosts_leftover(settings, launcher=hosts_launcher, hosts_path=hosts_path)
+        if note:
+            notes.append(note)
     rmtree(root)
     extra = "".join(" " + n for n in notes)
     if root.exists():

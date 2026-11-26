@@ -6,6 +6,10 @@ YARA, ML). ClamAV is not running normally: only when those checks flag a file (a
 settings.realtime_clamav_second_opinion is on and ClamAV is set up) is ClamAV started, the file
 checked again with it as well, and ClamAV stopped again after settings.clamav_idle_stop_s with
 nothing to do.
+
+Phase 4: a flagged file's fingerprint is asked on MalwareBazaar inside check_file (when lookups
+are on and your abuse.ch key is saved); a file MalwareBazaar knows needs no ClamAV second
+opinion. While Game mode is on (phase4.game_mode) ClamAV is not started for second opinions.
 """
 from __future__ import annotations
 
@@ -123,9 +127,13 @@ class RealtimeChecker:
         """Checks one file. None when it is gone, is a folder or a link, or nothing can check it
         yet (no signatures)."""
         display = winpath.to_display(os.path.abspath(winpath.to_display(str(display_path))))
+        # check_file also asks MalwareBazaar about a flagged file (engine.add_lookup, Phase 4),
+        # here on the engine thread, after the first checks.
         first = self.call(self._check, display)
         if first is None or first.status != SCANNED or first.level == CLEAN:
             return first
+        if any(f.engine == "lookup" for f in first.findings):
+            return first           # an exact known-malware match: ClamAV can't make it stronger
         clam = self._second_opinion_detector()     # may take a minute: not on the engine thread
         if clam is None:
             return first
@@ -184,6 +192,8 @@ class RealtimeChecker:
     def _second_opinion_detector(self):
         s = self.settings
         if not (getattr(s, "realtime_clamav_second_opinion", True) and getattr(s, "clamav_enabled", True)):
+            return None
+        if _game_mode_on(self.store):     # Phase 4: no ClamAV while you play or present
             return None
         with self._clam_lock:
             if self._clam_open:
@@ -312,6 +322,14 @@ class RealtimeChecker:
             return int(row[0]) if row else 0
         except Exception:
             return 0
+
+
+def _game_mode_on(store) -> bool:
+    from .. import phase4
+    try:
+        return phase4.game_mode(store)["active"]
+    except Exception:
+        return False
 
 
 def _version(d) -> str:

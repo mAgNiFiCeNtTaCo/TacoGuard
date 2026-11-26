@@ -1,7 +1,7 @@
 """TacoGuard: a second-opinion malware scanner for Windows."""
 import os as _os
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 APP_NAME = "TacoGuard"
 
 # The ML model (LightGBM, OpenMP) scores one file at a time. With OpenMP's defaults it starts a

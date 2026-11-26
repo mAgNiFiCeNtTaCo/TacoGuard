@@ -43,8 +43,9 @@ LEARN_AFTER = 3                                   # different files marked safe 
 CONFIRMED_LIST = "your-confirmed-threats.txt"     # in settings.hashset_dir
 NOT_A_THREAT = "not_a_threat"
 CONFIRMED = "confirmed_threat"
-# exact fingerprints are never softened; the ML check has one rule name for every finding
-NOT_LEARNED_ENGINES = ("hash", "ml")
+# exact fingerprints are never softened (your known-bad list, a MalwareBazaar lookup); the ML
+# check has one rule name for every finding
+NOT_LEARNED_ENGINES = ("hash", "ml", "lookup")
 
 ACTIVE, CANCELLED, FORGOTTEN = "active", "cancelled", "forgotten"
 STATE_WORDS = {
