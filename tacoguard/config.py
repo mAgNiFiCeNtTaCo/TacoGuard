@@ -81,6 +81,14 @@ ENDPOINTS = [
         "sends": "The file's SHA-256 hash and your abuse.ch key. Never the file, its name or its contents.",
     },
     {
+        "host": "ctldl.windowsupdate.com",
+        "why": "Contacted by Windows itself, not by TacoGuard: when a site's root certificate isn't on this PC "
+               "yet, TacoGuard asks Windows to check the site's certificate, and Windows downloads the root from "
+               "Windows Update if Microsoft trusts it (the same thing Edge does).",
+        "when": "Only when a download fails because a root certificate is missing (at most once per site per run).",
+        "sends": "Nothing about you or your files (Windows asks for a certificate).",
+    },
+    {
         "host": "current.cvd.clamav.net",
         "why": "freshclam looks up this name (a DNS question, no download) to learn the newest signature versions, so it downloads only when something changed.",
         "when": UPDATE_WHEN,

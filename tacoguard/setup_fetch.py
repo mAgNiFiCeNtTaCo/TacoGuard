@@ -136,7 +136,16 @@ def _open(url: str, headers: dict | None = None):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
     opener = urllib.request.build_opener(_CheckedRedirects())
     try:
-        return opener.open(req, timeout=HTTP_TIMEOUT)
+        try:
+            return opener.open(req, timeout=HTTP_TIMEOUT)
+        except urllib.error.URLError as e:
+            # The site's root certificate isn't on this PC yet: let Windows fetch it (only roots
+            # Microsoft trusts), then try once more with the same full check (winroots.py).
+            from . import winroots
+            if isinstance(e, urllib.error.HTTPError) or not winroots.missing_issuer(e) \
+                    or not winroots.fetch_root(urllib.parse.urlsplit(url).hostname or ""):
+                raise
+            return urllib.request.build_opener(_CheckedRedirects()).open(req, timeout=HTTP_TIMEOUT)
     except urllib.error.HTTPError as e:
         raise FetchError(_http_error_words(e, url), kind="http", code=e.code) from e
     except (urllib.error.URLError, socket.timeout, ConnectionError) as e:

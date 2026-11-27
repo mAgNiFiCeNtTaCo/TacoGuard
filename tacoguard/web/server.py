@@ -2002,6 +2002,7 @@ class App:
                 self.log.error("website list refresh failed\n%s", traceback.format_exc())
                 self.lists_action["error"] = self._plain_web_error(e, "updating the website lists")
             finally:
+                self._plan_cache = (0.0, None)    # the hosts plan counts the new lists at once
                 self.lists_action["finished"] = time.time()
                 self.lists_action["running"] = False
                 try:

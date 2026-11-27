@@ -169,6 +169,12 @@ With your abuse.ch key it also contacts `urlhaus-api.abuse.ch` (the malware-site
 runs, and when you press **Check for updates**. The Settings page lists every address it can
 contact. It never sends your files, their names or anything about you.
 
+Sometimes a site's root certificate isn't on the PC yet: Windows downloads those the first time a
+program needs one. When that happens, TacoGuard asks Windows to check the site's certificate, and
+Windows fetches the root from Windows Update (`ctldl.windowsupdate.com`), as it does for Edge.
+Windows adds only roots that Microsoft trusts, and TacoGuard then tries once more with the full
+certificate check.
+
 ## How updates are checked
 
 TacoGuard's own packages (the app and the ML model) are listed in a file signed with an Ed25519

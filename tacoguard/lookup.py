@@ -93,9 +93,19 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
 
 def _open_request(req: urllib.request.Request, timeout: float):
     """Opens the request (TLS certificate checked). Tests replace this function."""
-    ctx = ssl.create_default_context()
-    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx), _NoRedirects())
-    return opener.open(req, timeout=timeout)
+    def attempt():
+        ctx = ssl.create_default_context()           # fresh, so a root Windows just added is seen
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx), _NoRedirects())
+        return opener.open(req, timeout=timeout)
+    try:
+        return attempt()
+    except urllib.error.URLError as e:
+        # root certificate not on this PC yet: let Windows fetch it, then one more fully checked try
+        from . import winroots
+        if isinstance(e, urllib.error.HTTPError) or not winroots.missing_issuer(e) \
+                or not winroots.fetch_root(urllib.parse.urlsplit(req.full_url).hostname or ""):
+            raise
+        return attempt()
 
 
 def _read_capped(resp) -> bytes:
