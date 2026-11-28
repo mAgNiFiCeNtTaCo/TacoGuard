@@ -26,7 +26,8 @@ different bytes is refused; every downloaded file must match length + sha256 bef
                                        "checksum", "rollback", "expired", "format", "test" or
                                        "not_set_up". The updater shows "expired" as its own calm
                                        component state "expired" (no warning banner).
-    load_trusted_root(settings) -> dict          (data/root.json, or a newer stored one in updates_dir)
+    load_trusted_root(settings) -> dict          (data/root.json, then the newer signed root files stored in
+                                                  updates_dir/roots, each checked again against the one before)
     verify_root_update(trusted: dict, new_bytes: bytes) -> dict
     verify_targets(root: dict, targets_bytes: bytes, last_version: int) -> dict   (the "signed" part)
     verify_file(path, target_entry: dict) -> None

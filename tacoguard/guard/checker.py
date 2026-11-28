@@ -295,7 +295,7 @@ class RealtimeChecker:
             seen = self._reported.get(key)
             if seen and now - seen[0] < DEDUPE_S:
                 return seen[1]
-            earlier = self._earlier_event(result, now)
+            earlier = self._earlier_event(result, now, waiting=level != MALWARE)
             if earlier:
                 self._reported[key] = (now, earlier)
                 return earlier
@@ -313,12 +313,14 @@ class RealtimeChecker:
         log.info("Event %s (%s): %s", event_id, level, result.path)
         return event_id
 
-    def _earlier_event(self, result: FileResult, now: float) -> int:
-        """An event for the same file in the last 10 minutes (also from before a restart)."""
+    def _earlier_event(self, result: FileResult, now: float, waiting: bool = False) -> int:
+        """An event for the same file in the last 10 minutes (also from before a restart). With
+        `waiting`, also an older one for the same file that still waits for your answer, so a
+        suspicious program you start again doesn't add a second alert (malware always gets a new one)."""
         try:
-            row = self.store._con().execute(
-                "SELECT id FROM guard_events WHERE created > ? AND path = ? AND sha256 = ? "
-                "ORDER BY id DESC LIMIT 1", (now - DEDUPE_S, result.path, result.sha256 or "")).fetchone()
+            sql = ("SELECT id FROM guard_events WHERE path = ? AND sha256 = ? AND (created > ?"
+                   + (" OR state IN ('new', 'seen')" if waiting else "") + ") ORDER BY id DESC LIMIT 1")
+            row = self.store._con().execute(sql, (result.path, result.sha256 or "", now - DEDUPE_S)).fetchone()
             return int(row[0]) if row else 0
         except Exception:
             return 0

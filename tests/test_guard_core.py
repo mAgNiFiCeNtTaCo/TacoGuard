@@ -288,6 +288,25 @@ def test_duplicate_check_survives_a_new_checker(settings, store, det, watched):
     assert len(events(store)) == 1
 
 
+def test_waiting_suspicious_alert_is_not_repeated_later(settings, store, det, watched):
+    weak = watched / "own-build.exe"
+    weak.write_bytes(b"x" + WEAK_MARKER)
+    bad = watched / "bad.exe"
+    bad.write_bytes(sample_bytes())
+    c1 = RealtimeChecker(settings, store, [det])
+    first = c1.report(c1.check_path(str(weak)), "process")
+    bad_first = c1.report(c1.check_path(str(bad)), "process")
+    old = time.time() - checker_mod.DEDUPE_S - 60          # both alerts are older than 10 minutes
+    store._con().execute("UPDATE guard_events SET created=?", (old,))
+    c2 = RealtimeChecker(settings, store, [det])           # e.g. the next day, after a restart
+    assert c2.report(c2.check_path(str(weak)), "process") == first     # still waiting: same alert
+    assert c2.report(c2.check_path(str(bad)), "process") != bad_first  # malware: always a new one
+    # once you answered, a later start is news again
+    store.set_guard_event(first, state="resolved", action="dismissed")
+    c3 = RealtimeChecker(settings, store, [det])
+    assert c3.report(c3.check_path(str(weak)), "process") not in (first, None)
+
+
 def test_clean_and_suspicious_files(settings, store, chk, hub, watched):
     w = make_watcher(settings, store, chk, hub, watched)
     try:
@@ -1107,7 +1126,8 @@ def test_own_pids_count_only_our_own_programs(tmp_path):
     starter = ("import subprocess, sys, time\n"
                "a = subprocess.Popen([sys.argv[1], '-n', '60', '127.0.0.1'], stdout=subprocess.DEVNULL)\n"
                "b = subprocess.Popen([sys.argv[2], '-n', '60', '127.0.0.1'], stdout=subprocess.DEVNULL)\n"
-               "print(a.pid, b.pid, flush=True)\n"
+               "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', 'taco' + 'guard'])\n"
+               "print(a.pid, b.pid, c.pid, flush=True)\n"
                "time.sleep(60)\n")
     copies = {}
     for folder, name in (("other", "clamscan.exe"), ("data/engines/clamav", "clamd.exe"), ("elsewhere", "clamd.exe")):
@@ -1121,15 +1141,16 @@ def test_own_pids_count_only_our_own_programs(tmp_path):
     started: list[int] = []
     try:
         grandchild, clam_pid = (int(x) for x in taco.stdout.readline().split())
-        in_engines, elsewhere = (int(x) for x in plain.stdout.readline().split())
-        started += [grandchild, clam_pid, in_engines, elsewhere]
+        in_engines, elsewhere, stranger = (int(x) for x in plain.stdout.readline().split())
+        started += [grandchild, clam_pid, in_engines, elsewhere, stranger]
         own = procctl.tacoguard_pids(engines_dir=engines)
         assert os.getpid() in own
-        assert taco.pid in own                    # names tacoguard on its command line
-        assert clam_pid in own                    # ClamAV started by TacoGuard
-        assert in_engines in own                  # ClamAV from TacoGuard's engines folder
+        assert taco.pid in own                    # TacoGuard's interpreter, started by TacoGuard
+        assert in_engines in own                  # ClamAV from TacoGuard's engines\clamav folder
+        assert clam_pid not in own                # ClamAV-named, but from another folder
         assert grandchild not in own              # started by TacoGuard, but not TacoGuard
         assert plain.pid not in own and elsewhere not in own
+        assert stranger not in own                # names tacoguard, but nothing of ours started it
     finally:
         for pid in started:
             try:
@@ -1137,6 +1158,21 @@ def test_own_pids_count_only_our_own_programs(tmp_path):
             except psutil.Error:
                 pass
         _end(taco, plain)
+
+
+
+def test_a_program_calling_itself_python_is_not_tacoguard(tmp_path):
+    """TGUARD-20261127-01: a copy of any program named python.exe, with "tacoguard" on its
+    command line, started by TacoGuard's own process or not, is never TacoGuard's."""
+    fake = tmp_path / "python.exe"
+    shutil.copyfile(PING, fake)
+    child = subprocess.Popen([str(fake), *PING_ARGS, "-m", "tacoguard"], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, creationflags=0x08000000)
+    try:
+        assert child.pid not in procctl.tacoguard_pids(engines_dir=tmp_path / "engines")
+    finally:
+        child.kill()
+        child.wait(10)
 
 
 class FakeP:

@@ -107,7 +107,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if out["ok"] else 1
 
     settings = load_settings(args.data)
-    secure_root(settings)
+    from .config import DataFolderNotYours
+    try:
+        secure_root(settings)
+    except DataFolderNotYours as e:
+        print(str(e), file=sys.stderr, flush=True)
+        return 2
     settings.ensure_dirs()
 
     if args.cmd == "serve":

@@ -198,6 +198,11 @@ class ClamAVDetector:
             creationflags=CREATE_NO_WINDOW)
         self._job = _kill_on_close_job(int(self._proc._handle))
         _same_priority_as_us(self._proc.pid)
+        try:                                     # other programs can't end or freeze it mid-scan
+            from ..selfprotect import harden_child
+            harden_child(self._proc._handle, self._proc.pid, self.settings)
+        except ImportError:
+            pass
         try:
             self._wait_ready(started)
         except BaseException:

@@ -765,3 +765,110 @@ def test_undo_cut_off_after_the_removal_counts_as_undone(settings, store, roots,
     store.put_persistence(key, state="new", backup="")
     with pytest.raises(ValueError, match="no longer there"):
         w.undo(key)
+
+
+# ---- 0.4.2: entries Windows switches on and off by itself ---------------------------------------
+def _svc(reg_base, name, start, image):
+    with winreg.CreateKeyEx(HKCU, reg_base + rf"\Services\{name}", 0, winreg.KEY_WRITE) as k:
+        winreg.SetValueEx(k, "ImagePath", 0, winreg.REG_EXPAND_SZ, image)
+        winreg.SetValueEx(k, "Start", 0, winreg.REG_DWORD, start)
+
+
+def test_service_flipping_between_automatic_and_manual_is_reported_once(settings, store, roots, reg_base,
+                                                                        program):
+    w = _watcher(settings, store, roots)
+    w.scan_now()
+    _svc(reg_base, "Flip", 2, f'"{program}" -k')
+    assert w.scan_now() == ["service:Flip"]
+    for _ in range(3):                     # Windows sets it to "when needed" and back, again and again
+        _svc(reg_base, "Flip", 3, f'"{program}" -k')
+        assert w.scan_now() == []
+        assert store.get_persistence("service:Flip")["state"] == "new"     # still waiting for you
+        _svc(reg_base, "Flip", 2, f'"{program}" -k')
+        assert w.scan_now() == []
+    assert len(_events(store)) == 1
+    # a changed program while it was "when needed" is still news
+    _svc(reg_base, "Flip", 3, f'"{program}" -x')
+    w.scan_now()
+    _svc(reg_base, "Flip", 2, f'"{program}" -x')
+    assert w.scan_now() == ["service:Flip"]
+    # switched off (4) or deleted counts as removed
+    _svc(reg_base, "Flip", 4, f'"{program}" -x')
+    w.scan_now()
+    assert store.get_persistence("service:Flip")["state"] == "removed"
+
+
+def test_entry_back_by_itself_reopens_the_same_alert(settings, store, roots, reg_base, program):
+    run = reg_base + r"\Run"
+    w = _watcher(settings, store, roots)
+    w.scan_now()
+    _set(run, "Blinky", f'"{program}"')
+    w.scan_now()
+    first = store.get_persistence("run:HKCU:Blinky")["event_id"]
+    _delete_value(run, "Blinky")
+    w.scan_now()
+    assert store.get_guard_event(first)["action"] == "removed"
+    _set(run, "Blinky", f'"{program}"')
+    assert w.scan_now() == []                          # no second alert, no second pop-up
+    row = store.get_persistence("run:HKCU:Blinky")
+    assert row["state"] == "new" and row["event_id"] == first
+    ev = store.get_guard_event(first)
+    assert ev["state"] == "new" and ev["action"] == ""
+    assert len(_events(store)) == 1
+    # back with a different program: a new alert
+    _delete_value(run, "Blinky")
+    w.scan_now()
+    _set(run, "Blinky", f'"{program}" --other')
+    assert w.scan_now() == ["run:HKCU:Blinky"]
+    assert len(_events(store)) == 2
+
+
+def test_packaged_com_handler_is_found_only_inside_its_package(monkeypatch, tmp_path):
+    clsid = "{F47D8C53-0B74-4A66-959D-367710AB1F84}"
+    pkg = "Vendor.App_1.0.0.0_x64__abc"
+    root = tmp_path / "SystemApps" / "Vendor.App"
+    (root / "Task").mkdir(parents=True)
+    (root / "Task" / "Task.exe").write_bytes(b"harmless test file\n")
+    reg = {rf"{P._PKG_COM}\ClassIndex\{clsid}": {"subkeys": [pkg]},
+           rf"{P._PKG_COM}\Package\{pkg}\Class\{clsid}": {"ServerId": 1},
+           rf"{P._PKG_COM}\Package\{pkg}\Server\1": {"Executable": r"Task\Task.exe"}}
+    opened = []
+
+    class K:
+        def __init__(self, path):
+            self.path = path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_open(hive, path, *a):
+        opened.append((hive, path))
+        if path not in reg:
+            raise FileNotFoundError(path)
+        return K(path)
+
+    monkeypatch.setattr(P.winreg, "OpenKey", fake_open)
+    monkeypatch.setattr(P, "_subkeys", lambda k: reg[k.path].get("subkeys", []))
+    monkeypatch.setattr(P, "_query", lambda k, n: reg[k.path].get(n))
+    monkeypatch.setattr(P, "package_path", lambda name: str(root) if name == pkg else "")
+    assert P._com_dll(clsid) == str(root / "Task" / "Task.exe")
+    # only the all-users registry is read for packaged COM
+    assert all(h == winreg.HKEY_LOCAL_MACHINE for h, path in opened if "PackagedCom" in path)
+    # a path that leaves the package folder, or an absolute one, is refused
+    for bad in (r"..\..\evil.exe", str(tmp_path / "evil.exe"), r"C:evil.exe"):
+        (tmp_path / "evil.exe").write_bytes(b"x")
+        reg[rf"{P._PKG_COM}\Package\{pkg}\Server\1"] = {"Executable": bad}
+        assert P._com_dll(clsid) == "", bad
+    # a package Windows doesn't say is installed is not used
+    reg[rf"{P._PKG_COM}\Package\{pkg}\Server\1"] = {"Executable": r"Task\Task.exe"}
+    monkeypatch.setattr(P, "package_path", lambda name: "")
+    assert P._com_dll(clsid) == ""
+    assert P._com_dll("not a class id") == ""
+
+
+def test_real_package_path():
+    assert P.package_path("Not.A.Package_1.0.0.0_x64__nothing") == ""
+    assert P.package_path("") == ""

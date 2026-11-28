@@ -531,13 +531,82 @@ def parse_tasks_xml(text: str) -> list[dict]:
 
 
 def _com_dll(clsid: str) -> str:
-    """The DLL a COM class id loads (HKCR\\CLSID\\{x}\\InprocServer32), display path or ""."""
+    """The file a COM class id runs, display path or "": its DLL (HKCR\\CLSID\\{x}\\InprocServer32),
+    else its program (LocalServer32), else the program of a Windows app package that registered it
+    (packaged COM, as Windows' own SoftLanding / ActionCenter tasks use)."""
     try:
         with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"CLSID\{clsid}\InprocServer32") as k:
             val = winreg.QueryValueEx(k, "")[0]
-        return _find_file(_native_fix(expand_env(str(val))), (".dll",)) or ""
+        found = _find_file(_native_fix(expand_env(str(val))), (".dll",))
+        if found:
+            return found
     except (OSError, TypeError):
+        pass
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"CLSID\{clsid}\LocalServer32") as k:
+            val = winreg.QueryValueEx(k, "")[0]
+        found = resolve_target(str(val)) if isinstance(val, str) and val.strip() else ""
+        if found:
+            return found
+    except (OSError, TypeError):
+        pass
+    return _packaged_com_exe(clsid)
+
+
+_PKG_COM = r"SOFTWARE\Classes\PackagedCom"
+_CLSID_RX = re.compile(r"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}")
+
+
+def package_path(full_name: str) -> str:
+    """Where Windows installed an app package (GetPackagePathByFullName), or "" when it isn't
+    installed. Windows' own answer: never the user-writable copies of package settings."""
+    if os.name != "nt" or not full_name or len(full_name) > 200:
         return ""
+    try:
+        fn = ctypes.WinDLL("kernel32", use_last_error=True).GetPackagePathByFullName
+        fn.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.UINT), wintypes.LPWSTR]
+        fn.restype = wintypes.LONG
+        n = wintypes.UINT(0)
+        if fn(full_name, ctypes.byref(n), None) not in (0, 122) or not 0 < n.value < 4096:
+            return ""
+        buf = ctypes.create_unicode_buffer(n.value)
+        return buf.value if fn(full_name, ctypes.byref(n), buf) == 0 else ""
+    except (OSError, AttributeError, ValueError):
+        return ""
+
+
+def _packaged_com_exe(clsid: str) -> str:
+    """The program of a packaged COM class: read from the all-users registry only (an ordinary
+    program can't write there), inside the folder Windows says the package is installed in."""
+    if not _CLSID_RX.fullmatch(clsid or ""):
+        return ""
+    hk = winreg.HKEY_LOCAL_MACHINE
+    try:
+        with winreg.OpenKey(hk, rf"{_PKG_COM}\ClassIndex\{clsid}", 0, winreg.KEY_READ | _view(hk)) as k:
+            packages = _subkeys(k)[:50]
+    except OSError:
+        return ""
+    for pkg in reversed(packages):          # newest version last in the list: try it first
+        root = package_path(pkg)
+        if not root:
+            continue
+        try:
+            with winreg.OpenKey(hk, rf"{_PKG_COM}\Package\{pkg}\Class\{clsid}", 0,
+                                winreg.KEY_READ | _view(hk)) as k:
+                server = _query(k, "ServerId")
+            if not isinstance(server, int):
+                continue
+            with winreg.OpenKey(hk, rf"{_PKG_COM}\Package\{pkg}\Server\{server}", 0,
+                                winreg.KEY_READ | _view(hk)) as k:
+                exe = _query(k, "Executable")
+        except OSError:
+            continue
+        if not isinstance(exe, str) or not exe.strip() or os.path.isabs(exe) or ":" in exe:
+            continue
+        path = os.path.normpath(os.path.join(root, exe.strip()))
+        if winpath.is_under(path, root) and os.path.isfile(winpath.to_long(path)):
+            return path
+    return ""
 
 
 # ---- WMI event subscriptions ------------------------------------------------------------------------
@@ -585,11 +654,14 @@ def read_wmi() -> list[dict] | None:
 
 # ---- reading the sources ----------------------------------------------------------------------------
 class _Read:
-    """One source's entries this pass. `unknown`: keys that could not be read (never 'removed')."""
+    """One source's entries this pass. `unknown`: keys that could not be read (never 'removed').
+    `dormant`: keys there but not starting by themselves right now (never 'removed' either)."""
 
-    def __init__(self, entries: list[dict], unknown: set[str] | None = None):
+    def __init__(self, entries: list[dict], unknown: set[str] | None = None,
+                 dormant: set[str] | None = None):
         self.entries = entries
         self.unknown = unknown or set()
+        self.dormant = dormant or set()
 
 
 def _values(hive, path) -> list[tuple] | None:
@@ -732,14 +804,22 @@ def _read_services(sid, spec) -> _Read | None:
         return _Read([])
     except OSError:
         return None
-    out, unknown = [], set()
+    out, unknown, dormant = [], set(), set()
     with k:
         for name in _subkeys(k):
             try:
                 with winreg.OpenKey(k, name) as sk:
                     image = _query(sk, "ImagePath")
                     start = _query(sk, "Start")
-                    if not isinstance(image, str) or not image.strip() or start not in (0, 1, 2):
+                    if not isinstance(image, str) or not image.strip():
+                        continue
+                    if start == 3:
+                        # "start when needed": Windows flips some services (BITS) between this and
+                        # automatic by itself. Not a start-up entry, but not "removed" either, so
+                        # flipping back is not reported as new again.
+                        dormant.add(f"{sid}:{name}")
+                        continue
+                    if start not in (0, 1, 2):
                         continue
                     dll = _query(sk, "ServiceDll")
                     if not dll:
@@ -757,7 +837,7 @@ def _read_services(sid, spec) -> _Read | None:
                 extra["dll"] = dll.strip()
             out.append(_entry(sid, name, name, command, location=f"Windows services: {name}",
                               resolve=image, when=_SERVICE_WHEN[start], **extra))
-    return _Read(out, unknown)
+    return _Read(out, unknown, dormant)
 
 
 def _read_tasks(runner) -> tuple[_Read | None, float]:
@@ -1200,6 +1280,11 @@ class PersistenceWatcher:
                 elif ev and ev.get("action") == "undone":
                     self._report(e, fields, "back", row)
                     new_keys.append(key)
+                elif ev and ev.get("action") == "removed":
+                    # it went away by itself before you chose, and is back unchanged: the same alert
+                    # opens again instead of a new one each time (Windows does this with some entries)
+                    self.store.set_guard_event(ev["id"], state="new", action="")
+                    self.store.put_persistence(key, **fields, state="new")
                 else:
                     self._report(e, fields, "new", row)
                     new_keys.append(key)
@@ -1209,7 +1294,7 @@ class PersistenceWatcher:
                 self._report(e, fields, "changed", row)
                 new_keys.append(key)
         for key, row in rows.items():
-            if key in present or key in res.unknown:
+            if key in present or key in res.unknown or key in res.dormant:
                 continue
             if row["state"] in ("removed", "undone") or row.get("backup"):
                 continue          # turned off by you, or an undo / restore is half-way

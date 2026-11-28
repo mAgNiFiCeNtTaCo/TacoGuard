@@ -43,8 +43,8 @@ TacoGuard's own processes, files and its one Run value is ever touched.
         - the "TacoGuard" Run value (only for the installed copy, while settings.start_at_sign_in):
           removed or changed by another program -> event (never silently re-added);
         - the data folder's ACL (only when config.secure_root's marker says it was locked): an
-          entry that lets Everyone / Users / Authenticated Users / Interactive write -> locked
-          again (config.secure_root's icacls) and an event.
+          entry that lets any account other than yours, SYSTEM and Administrators write -> locked
+          again (config.secure_root: the whole permission list replaced) and an event.
         settings.json changed by another program is NOT watched (it needs the page to record its
         own writes; see the Phase 4 report).
 """
@@ -373,6 +373,25 @@ def harden_parent_launcher() -> bool:
         return False
 
 
+def harden_child(handle, pid: int, settings=None) -> bool:
+    """Protect a helper program TacoGuard just started (clamd, TGUARD-20261127-03) like this
+    process: `handle` is the Popen handle (it keeps full rights, so TacoGuard can still end it),
+    `pid` its id for the thread pass. Off with settings.self_protection or while pytest runs.
+    Never raises."""
+    try:
+        if settings is not None and not getattr(settings, "self_protection", True):
+            return False
+        if os.environ.get(HARDEN_TEST_ENV) or os.name != "nt":
+            return False
+        if _set_dacl(wintypes.HANDLE(int(handle)), _sddls()[0]) != 0:
+            return False
+        harden_threads(pid)
+        return True
+    except Exception:
+        log.exception("Self-protection: protecting a helper program failed")
+        return False
+
+
 def maybe_harden(settings, logger=None) -> bool:
     """harden_process() (and harden_parent_launcher()) when settings.self_protection is on; never
     while pytest runs (tests that harden a child call harden_process() themselves). Never raises."""
@@ -607,11 +626,27 @@ class _Acl(ctypes.Structure):
 INHERITED_ACE = 0x10
 
 
-def folder_open_to(path, explicit_only: bool = False) -> list[str]:
-    """Names of the broad groups (Everyone, Users, ...) the folder's DACL lets write, change rights
-    or delete; ["Everyone"] for a missing (null) DACL. [] when it is locked. explicit_only: only
-    entries set on this folder itself (not inherited from its parent). Raises OSError when
-    Windows does not say."""
+NULL_DACL = "(no permission list: everyone)"
+OWNER_SECURITY_INFORMATION = 0x00000001
+# accounts the data folder may give rights to besides your own: SYSTEM, Administrators, and the
+# "creator owner" / "owner rights" placeholders (they stand for the owner, who is checked separately)
+LOCK_OK_SIDS = frozenset({"S-1-5-18", "S-1-5-32-544", "S-1-3-0", "S-1-3-4"})
+
+
+def _sid_str(psid: int) -> str:
+    out = ctypes.c_wchar_p()
+    if not _adv().ConvertSidToStringSidW(ctypes.c_void_p(psid), ctypes.byref(out)):
+        return ""
+    try:
+        return out.value or ""
+    finally:
+        _k32().LocalFree(out)
+
+
+def folder_writer_sids(path, explicit_only: bool = False) -> list[str]:
+    """String SIDs the folder's DACL lets write, change rights or delete; [NULL_DACL] for a missing
+    (null) DACL. explicit_only: only entries set on this folder itself (not inherited from its
+    parent). Raises OSError when Windows does not say."""
     k32, adv = _k32(), _adv()
     dacl, sd = ctypes.c_void_p(), ctypes.c_void_p()
     rc = adv.GetNamedSecurityInfoW(str(path), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, None, None,
@@ -620,7 +655,7 @@ def folder_open_to(path, explicit_only: bool = False) -> list[str]:
         raise OSError(rc, "GetNamedSecurityInfoW failed")
     try:
         if not dacl.value:
-            return ["Everyone"]
+            return [NULL_DACL]
         acl = _Acl.from_address(dacl.value)
         found = []
         for i in range(acl.AceCount):
@@ -632,33 +667,153 @@ def folder_open_to(path, explicit_only: bool = False) -> list[str]:
                 continue
             if explicit_only and ace.Header.AceFlags & INHERITED_ACE:
                 continue
-            sid_ptr = pace.value + _AllowedAce.SidStart.offset
-            out = ctypes.c_wchar_p()
-            if not adv.ConvertSidToStringSidW(ctypes.c_void_p(sid_ptr), ctypes.byref(out)):
-                continue
-            try:
-                sid = out.value
-            finally:
-                k32.LocalFree(out)
-            name = BROAD_SIDS.get(sid)
-            if name and name not in found:
-                found.append(name)
+            sid = _sid_str(pace.value + _AllowedAce.SidStart.offset)
+            if sid and sid not in found:
+                found.append(sid)
         return found
     finally:
         k32.LocalFree(sd)
 
 
-def open_subfolders(root) -> list[Path]:
-    """First-level subfolders of the data folder with their OWN entries that let a broad group
+def folder_owner_sid(path) -> str:
+    """The string SID of the folder's owner. Raises OSError when Windows does not say."""
+    k32, adv = _k32(), _adv()
+    owner, sd = ctypes.c_void_p(), ctypes.c_void_p()
+    rc = adv.GetNamedSecurityInfoW(str(path), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, ctypes.byref(owner),
+                                   None, None, None, ctypes.byref(sd))
+    if rc != 0:
+        raise OSError(rc, "GetNamedSecurityInfoW failed")
+    try:
+        sid = _sid_str(owner.value) if owner.value else ""
+        if not sid:
+            raise OSError(1, "the folder has no owner")
+        return sid
+    finally:
+        k32.LocalFree(sd)
+
+
+def account_name(sid: str) -> str:
+    """A readable name for a SID ("Everyone", "PC\\bob"), else the SID itself."""
+    if sid in BROAD_SIDS:
+        return BROAD_SIDS[sid]
+    if sid == NULL_DACL:
+        return "Everyone"
+    try:
+        adv = _adv()
+        psid = ctypes.c_void_p()
+        adv.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+        if not adv.ConvertStringSidToSidW(sid, ctypes.byref(psid)):
+            return sid
+        try:
+            name, dom = ctypes.create_unicode_buffer(256), ctypes.create_unicode_buffer(256)
+            n1, n2, use = wintypes.DWORD(256), wintypes.DWORD(256), wintypes.DWORD()
+            adv.LookupAccountSidW.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p, wintypes.LPWSTR,
+                                              ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR,
+                                              ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD)]
+            if adv.LookupAccountSidW(None, psid, name, ctypes.byref(n1), dom, ctypes.byref(n2), ctypes.byref(use)):
+                return f"{dom.value}\\{name.value}" if dom.value else name.value
+            return sid
+        finally:
+            _k32().LocalFree(psid)
+    except (OSError, AttributeError):
+        return sid
+
+
+def folder_others(path, explicit_only: bool = False, me: str | None = None) -> list[str]:
+    """SIDs other than yours, SYSTEM and Administrators that the folder lets write."""
+    me = me or current_user_sid()
+    return [s for s in folder_writer_sids(path, explicit_only) if s != me and s not in LOCK_OK_SIDS]
+
+
+def folder_open_to(path, explicit_only: bool = False) -> list[str]:
+    """Names of the broad groups (Everyone, Users, ...) the folder's DACL lets write, change rights
+    or delete; ["Everyone"] for a missing (null) DACL. [] when it is locked. explicit_only: only
+    entries set on this folder itself (not inherited from its parent). Raises OSError when
+    Windows does not say."""
+    found = []
+    for sid in folder_writer_sids(path, explicit_only):
+        name = "Everyone" if sid == NULL_DACL else BROAD_SIDS.get(sid)
+        if name and name not in found:
+            found.append(name)
+    return found
+
+
+def lock_sddl(user_sid: str) -> str:
+    """The data folder's protected DACL: full control for you, SYSTEM and Administrators only,
+    inherited by everything inside."""
+    return f"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user_sid})"
+
+
+def _sd_from(sddl: str) -> ctypes.c_void_p:
+    sd = ctypes.c_void_p()
+    if not _adv().ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, ctypes.byref(sd), None):
+        raise OSError(ctypes.get_last_error() or 1, "ConvertStringSecurityDescriptorToSecurityDescriptorW failed")
+    return sd
+
+
+def create_locked_folder(path) -> bool:
+    """Make the folder with the lock already on it (no moment where another account could get in).
+    False when it already exists. Raises OSError when Windows refuses."""
+
+    class SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("nLength", wintypes.DWORD), ("lpSecurityDescriptor", ctypes.c_void_p),
+                    ("bInheritHandle", wintypes.BOOL)]
+
+    k32 = _k32()
+    sd = _sd_from(lock_sddl(current_user_sid()))
+    try:
+        sa = SECURITY_ATTRIBUTES(ctypes.sizeof(SECURITY_ATTRIBUTES), sd, False)
+        k32.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(SECURITY_ATTRIBUTES)]
+        if k32.CreateDirectoryW(str(path), ctypes.byref(sa)):
+            return True
+        err = ctypes.get_last_error()
+        if err == 183:                      # ERROR_ALREADY_EXISTS
+            return False
+        raise OSError(err, "CreateDirectoryW failed")
+    finally:
+        k32.LocalFree(sd)
+
+
+def lock_folder(path) -> int:
+    """Replace the folder's whole DACL with lock_sddl (every other account's own entries go, and
+    the folder stops inheriting from its parent); folders and files inside inherit it. 0 when
+    Windows accepted it, else the Windows error."""
+    k32, adv = _k32(), _adv()
+    try:
+        sd = _sd_from(lock_sddl(current_user_sid()))
+    except OSError as e:
+        return e.errno or 1
+    try:
+        present, defaulted = wintypes.BOOL(), wintypes.BOOL()
+        dacl = ctypes.c_void_p()
+        if not adv.GetSecurityDescriptorDacl(sd, ctypes.byref(present), ctypes.byref(dacl),
+                                             ctypes.byref(defaulted)) or not present or not dacl:
+            return 1
+        adv.SetNamedSecurityInfoW.argtypes = [wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p,
+                                              ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        adv.SetNamedSecurityInfoW.restype = wintypes.DWORD
+        return int(adv.SetNamedSecurityInfoW(str(path), SE_FILE_OBJECT,
+                                             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                             None, None, dacl, None))
+    finally:
+        k32.LocalFree(sd)
+
+
+def open_subfolders(root, me: str | None = None) -> list[Path]:
+    """First-level subfolders of the data folder with their OWN entries that let another account
     write (inherited ones come from the locked data folder and are fine)."""
     out = []
     try:
         subs = [p for p in Path(root).iterdir() if p.is_dir() and not p.is_symlink()]
     except OSError:
         return out
+    try:
+        me = me or current_user_sid()
+    except OSError:
+        return out
     for p in sorted(subs):
         try:
-            if folder_open_to(p, explicit_only=True):
+            if folder_others(p, explicit_only=True, me=me):
                 out.append(p)
         except OSError:
             continue
@@ -666,24 +821,35 @@ def open_subfolders(root) -> list[Path]:
 
 
 def data_folder_open_to(root) -> list[str]:
-    """The broad groups that may write into the data folder itself or (by their own entries) into
-    one of its first-level subfolders. Raises OSError when Windows does not say about the folder."""
-    found = list(folder_open_to(root))
-    for p in open_subfolders(root):
-        for name in folder_open_to(p, explicit_only=True):
-            if name not in found:
-                found.append(name)
+    """Names of the accounts other than yours, SYSTEM and Administrators that may write into the
+    data folder itself or (by their own entries) into one of its first-level subfolders. Raises
+    OSError when Windows does not say about the folder."""
+    me = current_user_sid()
+    sids = list(folder_others(root, me=me))
+    for p in open_subfolders(root, me=me):
+        for sid in folder_others(p, explicit_only=True, me=me):
+            if sid not in sids:
+                sids.append(sid)
+    found = []
+    for sid in sids:
+        name = account_name(sid)
+        if name not in found:
+            found.append(name)
     return found
 
 
 def relock_data_folder(settings) -> bool:
-    """config.secure_root(force=True): the lock again (inheritance off, your account + SYSTEM +
-    Administrators, the broad groups' own entries taken out), and first-level subfolders with
-    their own open entries reset to inherit from it. The marker file stays all along. True when
-    the folder is locked afterwards."""
-    from .config import secure_root
+    """config.secure_root(force=True): the lock again (inheritance off, only your account + SYSTEM +
+    Administrators), and first-level subfolders with their own entries for other accounts reset
+    to inherit from it. The marker file stays all along. True when the folder is locked
+    afterwards; False also when the folder belongs to another account."""
+    from .config import DataFolderNotYours, secure_root
     root = Path(settings.root)
-    note = secure_root(settings, force=True)
+    try:
+        note = secure_root(settings, force=True)
+    except DataFolderNotYours as e:
+        log.warning("Self-protection: %s", e)
+        return False
     log.info("Self-protection: %s", note)
     try:
         return not data_folder_open_to(root)

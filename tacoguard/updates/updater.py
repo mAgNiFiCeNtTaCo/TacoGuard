@@ -121,9 +121,10 @@ def _plain(e: BaseException) -> str:
 # ---------------------------------------------------------------------------------------------
 
 def fetch_verified_targets(source, root: dict, last_version: int = 0, last_sha256: str = "",
-                           now=None) -> tuple[dict, dict, bytes, bool]:
+                           now=None, root_files: list | None = None) -> tuple[dict, dict, bytes, bool]:
     """Follow root rotations in the source one version at a time, then verify targets.json.
-    Returns (root, targets signed part, raw targets bytes, root_changed). Raises
+    Returns (root, targets signed part, raw targets bytes, root_changed). root_files (optional
+    list): gets the raw bytes of every root file that was verified, oldest first. Raises
     sources.SourceError (network / not published) or UpdateRejected."""
     source.refresh()
     start_root = root
@@ -142,6 +143,8 @@ def fetch_verified_targets(source, root: dict, last_version: int = 0, last_sha25
                 break
             raw = latest                           # == want, or > want: refused as "skips"
         root = signed.verify_root_update(root, raw)
+        if root_files is not None:
+            root_files.append(raw)
     signed.check_root_fresh(root, now)
     root_changed = root["version"] != start_root["version"]
     if root_changed and signed.targets_keys_changed(start_root, root):
@@ -674,10 +677,11 @@ class Updater:
     def _verified_targets(self) -> dict:
         root = signed.load_trusted_root(self.settings)
         state = signed.load_state(self.settings)
+        walked: list[bytes] = []
         root, targets, raw, _changed = fetch_verified_targets(
             self.source, root, int(state.get("targets_version") or 0),
-            str(state.get("targets_sha256") or ""))
-        signed.remember(self.settings, root, targets, raw)
+            str(state.get("targets_sha256") or ""), root_files=walked)
+        signed.remember(self.settings, root, targets, raw, root_files=walked)
         return targets
 
     def _download_target(self, name: str, entry: dict, dest: Path, comp: str) -> Path:

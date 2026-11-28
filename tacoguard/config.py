@@ -265,58 +265,62 @@ def clamav_thread_count(settings) -> int:
     return max(1, min(CLAMAV_THREADS_MAX, n))
 
 
-# broad groups whose own entries the forced lock takes out (Everyone, Users, Authenticated Users,
-# Interactive, Guests, Local, Anonymous)
-BROAD_GROUP_SIDS = ("S-1-1-0", "S-1-5-32-545", "S-1-5-11", "S-1-5-4", "S-1-5-32-546", "S-1-2-0", "S-1-5-7")
+class DataFolderNotYours(Exception):
+    """The data folder belongs to another Windows account: TacoGuard won't use it (that account could
+    put its own programs there for TacoGuard to run). The message is plain English."""
 
 
 def secure_root(settings: "Settings", force: bool = False) -> str:
     """Lock the data folder to the current user, SYSTEM and Administrators (no admin rights needed:
     the user owns the folder). Done once; a marker file records it. Returns a plain-English note.
 
+    A missing folder is made with the lock already on it. A folder owned by another account
+    (someone made it first, TGUARD-20261127-02) raises DataFolderNotYours, every time, marker or
+    not. The lock REPLACES the folder's whole permission list (selfprotect.lock_folder), so other
+    accounts' own entries go too.
+
     force=True (self-protection found it opened again): lock it again although the marker says it
     was done. The marker is never deleted first, so a failed relock still counts as "was locked"
-    and is looked at again; the broad groups' own entries are taken out (/grant:r keeps entries
-    of other accounts), and first-level subfolders with their own entries for those groups are
+    and is looked at again; first-level subfolders with their own entries for other accounts are
     reset to inherit the lock (icacls /reset)."""
-    import getpass
     import subprocess
 
     root = settings.root
-    root.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        root.mkdir(parents=True, exist_ok=True)
+        return "Data folder ready."
+    from . import selfprotect as sp
+    root.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        sp.create_locked_folder(root)
+    except OSError:
+        root.mkdir(parents=True, exist_ok=True)       # e.g. a drive Windows can't put a lock on
+    try:
+        owner, me = sp.folder_owner_sid(root), sp.current_user_sid()
+    except OSError as e:
+        return f"Could not check who owns the data folder ({e})."
+    if owner != me and owner not in ("S-1-5-32-544", "S-1-5-18"):
+        raise DataFolderNotYours(
+            f"The data folder {root} belongs to another Windows account ({sp.account_name(owner)}), so "
+            "TacoGuard won't use it: that account could put its own programs in it. Delete or rename "
+            "that folder (it may need an administrator), or choose another data folder with --data.")
     marker = root / ".locked"
     if marker.exists() and not force:
         return "Data folder already locked to your account and administrators."
-    user = os.environ.get("USERDOMAIN", "") + "\\" + getpass.getuser() if os.environ.get("USERDOMAIN") \
-        else getpass.getuser()
-    icacls = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icacls.exe")
-
-    def run(args) -> tuple[bool, str]:
-        try:
-            r = subprocess.run([icacls, *args], capture_output=True, text=True, creationflags=0x08000000,
-                               timeout=120)
-        except (OSError, subprocess.SubprocessError) as e:
-            return False, str(e)
-        return r.returncode == 0, (r.stderr or r.stdout or "").strip()
-
-    ok, out = run([str(root), "/inheritance:r",
-                   "/grant:r", f"{user}:(OI)(CI)F",
-                   "/grant:r", "*S-1-5-18:(OI)(CI)F",        # SYSTEM
-                   "/grant:r", "*S-1-5-32-544:(OI)(CI)F"])   # Administrators
-    if not ok:
-        return "Could not lock the data folder: " + out
+    rc = sp.lock_folder(root)
+    if rc:
+        return f"Could not lock the data folder (Windows error {rc})."
     if force:
-        ok, out = run([str(root), "/remove:g", *(f"*{sid}" for sid in BROAD_GROUP_SIDS)])
-        if not ok:
-            return "Could not take the open entries off the data folder: " + out
-        try:
-            from .selfprotect import open_subfolders
-            for sub in open_subfolders(root):
-                ok, out = run([str(sub), "/reset"])
-                if not ok:
-                    return f"Could not lock the folder {sub.name} inside the data folder: " + out
-        except ImportError:
-            pass
+        icacls = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icacls.exe")
+        for sub in sp.open_subfolders(root, me=me):
+            try:
+                r = subprocess.run([icacls, str(sub), "/reset"], capture_output=True, text=True,
+                                   creationflags=0x08000000, timeout=120)
+            except (OSError, subprocess.SubprocessError) as e:
+                return f"Could not lock the folder {sub.name} inside the data folder: {e}"
+            if r.returncode != 0:
+                return (f"Could not lock the folder {sub.name} inside the data folder: "
+                        + (r.stderr or r.stdout or "").strip())
     if not marker.exists():
         marker.write_text("locked by TacoGuard\n", encoding="utf-8")
     return "Data folder locked to your account and administrators."

@@ -134,7 +134,9 @@ class Quarantine:
             if not blob.exists():
                 raise QuarantineError(f"The quarantined copy of {name} is missing, so it can't be restored.")
             folder = os.path.dirname(original)
+            _no_links(folder, name)
             os.makedirs(folder, exist_ok=True)
+            _no_links(folder, name)
             _check_space(folder, row["size"], "Not enough free disk space to restore this file safely. "
                                               "Nothing was changed.")
         except Exception as exc:
@@ -297,6 +299,7 @@ class Quarantine:
         while True:
             target = _free_name(original)
             self.store.set_quarantine_state(qid, "restoring", winpath.to_display(target))
+            _no_links(os.path.dirname(original), os.path.basename(original))   # again, right before
             try:
                 os.rename(part, target)  # never replaces an existing file on Windows
                 return target
@@ -448,6 +451,34 @@ def _free_name(path: str) -> str:
         if not os.path.lexists(candidate):
             return candidate
         n += 1
+
+
+LINK_TAGS = (0xA0000003, 0xA000000C)      # junction / mount point, symbolic link
+
+
+def _link_on_path(folder: str) -> str:
+    """The first folder on the way to `folder` (drive root excluded) that is a junction or a
+    symbolic link, as shown to you, else "". A restore through one would land wherever the link
+    points, which whoever made it chose (TGUARD-20261127-06)."""
+    p = Path(winpath.to_display(folder))
+    for part in [*reversed(p.parents[:-1]), p] if p.parents else [p]:
+        try:
+            st = os.lstat(winpath.to_long(str(part)))
+        except FileNotFoundError:
+            break                            # the rest is made fresh by the restore
+        except OSError:
+            continue
+        if getattr(st, "st_reparse_tag", 0) in LINK_TAGS or stat.S_ISLNK(st.st_mode):
+            return str(part)
+    return ""
+
+
+def _no_links(folder: str, name: str) -> None:
+    link = _link_on_path(folder)
+    if link:
+        raise QuarantineError(
+            f"{name} was not restored: the folder {link} on its way back is now a link to another place, "
+            "so the file could end up somewhere you didn't choose. It is still safely in quarantine.")
 
 
 def _remove(path) -> None:

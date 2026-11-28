@@ -214,9 +214,19 @@ def parse_root(raw: bytes, label: str = "The built-in list of trusted release ke
     return signed
 
 
+ROOTS_DIR = "roots"           # updates_dir/roots/root-<version>.json: the signed files, as published
+
+
+def stored_root_path(settings, version: int) -> Path:
+    return Path(settings.updates_dir) / ROOTS_DIR / f"root-{int(version)}.json"
+
+
 def load_trusted_root(settings) -> dict:
-    """The signed part of the newest trusted root: tacoguard/data/root.json, or a newer one that
-    was verified earlier and stored in updates_dir/trusted.json."""
+    """The signed part of the newest trusted root: tacoguard/data/root.json, then every newer
+    signed root file stored by an earlier update (updates_dir/roots/root-<v>.json), each checked
+    again against the one before it (verify_root_update) at every load. A stored file that is
+    missing or fails its check ends the walk there: nothing stored on this PC is trusted on its
+    own (TGUARD-20261127-07). trusted.json's "root" is kept for the page, never trusted."""
     try:
         raw = SHIPPED_ROOT.read_bytes()
     except FileNotFoundError:
@@ -224,21 +234,23 @@ def load_trusted_root(settings) -> dict:
     except OSError as e:
         raise NoTrustedRoot("TacoGuard could not read its built-in release key list "
                             f"({e.strerror or e}), so its own updates are switched off.") from e
-    shipped = parse_root(raw) if raw is not None else None
-    stored = load_state(settings).get("root")
-    if isinstance(stored, dict):
-        try:
-            _check_root_shape(stored, "The stored list of trusted release keys")
-        except UpdateRejected:
-            stored = None
-    else:
-        stored = None
-    if shipped is None and stored is None:
+    if raw is None:
         raise NoTrustedRoot("TacoGuard's own update channel isn't set up yet (no release key is "
                             "built in), so only ClamAV and YARA updates run.")
-    if stored is None or (shipped is not None and shipped["version"] >= stored["version"]):
-        return shipped
-    return stored
+    root = parse_root(raw)
+    for _ in range(MAX_STORED_ROOTS):
+        try:
+            nxt = stored_root_path(settings, root["version"] + 1).read_bytes()
+        except OSError:
+            break
+        try:
+            root = verify_root_update(root, nxt)
+        except UpdateRejected:
+            break
+    return root
+
+
+MAX_STORED_ROOTS = 100
 
 
 def verify_root_update(trusted: dict, new_bytes: bytes) -> dict:
@@ -393,10 +405,19 @@ def write_bytes_atomic(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
-def remember(settings, root: dict, targets: dict, targets_bytes: bytes) -> None:
-    """Store the verified root and targets version (call only after both verified), and the raw
+def remember(settings, root: dict, targets: dict, targets_bytes: bytes,
+             root_files: list[bytes] | tuple = ()) -> None:
+    """Store the verified root and targets version (call only after both verified), the raw
     signed targets.json bytes in updates_dir/targets.json so selfupdate can verify the signatures
-    again before it installs anything."""
+    again before it installs anything, and the raw signed root files the update walked
+    (root_files, oldest first) so load_trusted_root can check the chain again."""
+    for rb in root_files:
+        try:
+            v = json.loads(bytes(rb).decode("utf-8"))["signed"]["version"]
+        except (ValueError, KeyError, TypeError, AttributeError, UnicodeDecodeError):
+            continue
+        if isinstance(v, int) and v > 0:
+            write_bytes_atomic(stored_root_path(settings, v), bytes(rb))
     write_bytes_atomic(Path(settings.updates_dir) / TARGETS_COPY, bytes(targets_bytes))
     save_state(settings, {"root": root, "targets_version": int(targets["version"]),
                           "targets_sha256": hashlib.sha256(bytes(targets_bytes)).hexdigest()})

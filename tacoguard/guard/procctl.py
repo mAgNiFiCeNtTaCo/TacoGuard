@@ -91,37 +91,97 @@ def _under(path: str, folder: str) -> bool:
     return p.startswith(f)
 
 
-def tacoguard_pids(engines_dir=None) -> set[int]:
-    """TacoGuard's own processes, never paused or ended: this process, every Python interpreter
-    whose command line names tacoguard (the page, the guard, scan workers, the launcher
-    TacoGuard.pyw; the venv's python.exe launcher and the real interpreter it starts both count),
-    and ClamAV's programs (clamd / clamscan / freshclam) that run from TacoGuard's engines folder
-    or were started by one of those. Nothing else: a browser the page opened, or a program
-    downloaded and run from it, is NOT TacoGuard's. engines_dir: the data folder's engines
-    folder (default: the default data folder's)."""
-    out = {os.getpid()}
-    engines = str(engines_dir) if engines_dir else _default_engines_dir()
-    clams: list[tuple[int, int, psutil.Process]] = []
+def _interpreters() -> set[str]:
+    """The exact Python programs TacoGuard runs with (normcased): this interpreter, the base one
+    a venv launcher starts, and the installed copy's venv. A python.exe anywhere else is not ours."""
+    import sys
+    paths = {sys.executable, getattr(sys, "_base_executable", "") or "",
+             os.path.join(sys.base_prefix, "python.exe"), os.path.join(sys.prefix, "Scripts", "python.exe")}
     try:
-        procs = list(psutil.process_iter(["name", "ppid"]))
+        from ..config import install_root
+        paths.add(str(install_root() / "venv" / "Scripts" / "python.exe"))
+    except Exception:
+        pass
+    try:
+        paths.add(psutil.Process().exe())
+    except (psutil.Error, OSError):
+        pass
+    out = set()
+    for p in filter(None, paths):
+        d, n = os.path.split(os.path.abspath(p))
+        stem = n.lower().removesuffix(".exe").removesuffix("w")
+        for variant in (stem + ".exe", stem + "w.exe"):        # python.exe and pythonw.exe
+            out.add(os.path.normcase(os.path.join(d, variant)))
+    return out
+
+
+def tacoguard_pids(engines_dir=None) -> set[int]:
+    """TacoGuard's own processes, never paused or ended. Found by who started whom, never by name
+    alone (a program can call itself python.exe and put "tacoguard" on its command line):
+    - this process, and the chain of processes that started it while each is one of TacoGuard's
+      own interpreters (_interpreters: exact paths) whose command line names tacoguard (the page,
+      the launcher TacoGuard.pyw, the venv's python.exe launcher);
+    - processes those started, and so on, that are such an interpreter too (the guard, scan
+      workers, the real interpreter behind a venv launcher);
+    - ClamAV's programs (clamd / clamscan / freshclam) only when they run from TacoGuard's own
+      engines\\clamav folder.
+    Nothing else: a browser the page opened, or a program downloaded and run from it, is NOT
+    TacoGuard's. engines_dir: the data folder's engines folder (default: the default data folder's)."""
+    me = os.getpid()
+    out = {me}
+    engines = str(engines_dir) if engines_dir else _default_engines_dir()
+    clam_dir = os.path.join(engines, "clamav") if engines else ""
+    known = _interpreters()
+    try:
+        procs = {p.pid: p for p in psutil.process_iter(["name", "ppid", "create_time"])}
     except psutil.Error:
         return out
-    for p in procs:
-        name = (p.info.get("name") or "").lower()
-        if _PYTHON_NAME.match(name):
-            try:
-                if "tacoguard" in " ".join(p.cmdline()).lower():
-                    out.add(p.pid)
-            except (psutil.Error, OSError):
-                continue
-        elif name in CLAMAV_NAMES:
-            clams.append((p.pid, int(p.info.get("ppid") or 0), p))
-    for pid, ppid, p in clams:
-        if ppid in out:
-            out.add(pid)
+    verdict: dict[int, bool] = {}
+
+    def ours_python(pid: int) -> bool:
+        if pid not in verdict:
+            p = procs.get(pid)
+            ok = False
+            if p is not None and _PYTHON_NAME.match((p.info.get("name") or "").lower()):
+                try:
+                    ok = (os.path.normcase(os.path.abspath(p.exe() or "")) in known
+                          and "tacoguard" in " ".join(p.cmdline()).lower())
+                except (psutil.Error, OSError):
+                    ok = False
+            verdict[pid] = ok
+        return verdict[pid]
+
+    def parent_of(pid: int) -> int:
+        p = procs.get(pid)
+        if p is None:
+            return 0
+        ppid = int(p.info.get("ppid") or 0)
+        parent = procs.get(ppid)
+        # Windows reuses pids: a "parent" that started after its child is someone else
+        if not parent or ppid == pid or (parent.info.get("create_time") or 0) > (p.info.get("create_time") or 0):
+            return 0
+        return ppid
+
+    pid = parent_of(me)
+    while pid and pid not in out and ours_python(pid):          # who started this process
+        out.add(pid)
+        pid = parent_of(pid)
+    children: dict[int, list[int]] = {}
+    for pid in procs:
+        pp = parent_of(pid)
+        if pp:
+            children.setdefault(pp, []).append(pid)
+    todo = list(out)
+    while todo:                                                 # what those started
+        for kid in children.get(todo.pop(), []):
+            if kid not in out and ours_python(kid):
+                out.add(kid)
+                todo.append(kid)
+    for pid, p in procs.items():
+        if pid in out or (p.info.get("name") or "").lower() not in CLAMAV_NAMES or not clam_dir:
             continue
         try:
-            if _under(p.exe() or "", engines):
+            if _under(p.exe() or "", clam_dir):
                 out.add(pid)
         except (psutil.Error, OSError):
             continue

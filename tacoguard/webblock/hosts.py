@@ -7,7 +7,9 @@
         Outcome is a str (the plain words) with .ok (True when the hosts file now is as asked)
         and .code ("done", "removed", "cancelled", "blocked", ...).
 
-How the admin step works (nothing it runs can be changed without administrator rights):
+How the admin step works (once installed, nothing it runs can be changed without administrator
+rights; the install step itself copies the helper from your installed copy, so it is refused
+while the install check finds TacoGuard's own files changed, TGUARD-20261127-04):
   - The user-level side (this module) prepares the names in settings.webblock_dir\\hosts-list.txt
     (malware sites first, your "never block" sites and protected names left out, at most 100,000,
     one name per line) and passes its path and SHA-256.
@@ -643,7 +645,18 @@ def _prepare_run(cleanup: bool = False) -> tuple[bytes, Path, bool, Outcome | No
     state = helper_state(script)
     if state == "open":
         return script, hdir, False, Outcome(OPEN_FOLDER_MSG.format(dir=hdir), code="error")
-    return script, hdir, state != "current", None
+    install = state != "current"
+    if install:
+        # the helper is copied from the installed copy, which your account can change: never hand
+        # it to an administrator step when TacoGuard's own files are not the ones it installed
+        # (TGUARD-20261127-04)
+        from ..selfprotect import check_install, install_message
+        problems = check_install()
+        if problems:
+            return script, hdir, False, Outcome(
+                install_message(problems) + " Until then TacoGuard won't ask for administrator rights.",
+                code="error")
+    return script, hdir, install, None
 
 
 def apply_elevated(settings, launcher=None, timeout: float = TIMEOUT_S, hosts_path=None) -> Outcome:

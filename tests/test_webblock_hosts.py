@@ -419,6 +419,19 @@ def test_a_helper_folder_others_can_change_is_never_run(settings, hosts_file, he
     assert not out.ok and "can be changed by other accounts" in out and calls == []
 
 
+def test_a_changed_install_never_gets_the_helper_installed(settings, hosts_file, helper, monkeypatch):
+    """TGUARD-20261127-04: the helper is copied from the installed copy, which the user's account can
+    change, so the admin step is refused while the install check finds changed files."""
+    from tacoguard import selfprotect
+    _lists(settings)
+    monkeypatch.setattr(selfprotect, "check_install", lambda *a, **k: ["changed: tacoguard/webblock/hosts-helper.ps1"])
+    calls = []
+    out = H.apply_elevated(settings, launcher=lambda e, p, t: calls.append(p) or 0, hosts_path=hosts_file)
+    assert not out.ok and calls == [] and "not the ones TacoGuard installed" in out
+    assert "won't ask for administrator rights" in out
+    assert hosts_file.read_bytes() == ORIGINAL
+
+
 def test_no_lists_yet(settings, hosts_file, helper):
     calls = []
     out = H.apply_elevated(settings, launcher=lambda e, p, t: calls.append(p) or 0, hosts_path=hosts_file)

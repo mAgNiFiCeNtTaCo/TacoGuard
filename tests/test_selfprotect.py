@@ -209,6 +209,27 @@ def test_own_handle_still_ends_a_hardened_child(tmp_path):
             child.kill()
 
 
+def test_a_helper_program_started_by_tacoguard_is_protected(tmp_path, monkeypatch, settings):
+    """TGUARD-20261127-03: clamd gets the same process rights as TacoGuard (a harmless ping stands
+    in), and TacoGuard's own handle still ends it."""
+    ping = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "PING.EXE")
+    child = subprocess.Popen([ping, "-n", "60", "127.0.0.1"], stdout=subprocess.DEVNULL, creationflags=NO_WINDOW)
+    try:
+        assert sp.harden_child(child._handle, child.pid, settings) is False    # never while pytest runs
+        monkeypatch.delenv("PYTEST_CURRENT_TEST")
+        settings.self_protection = False
+        assert sp.harden_child(child._handle, child.pid, settings) is False    # switched off
+        settings.self_protection = True
+        assert sp.harden_child(child._handle, child.pid, settings) is True
+        for access in (sp.PROCESS_TERMINATE, sp.PROCESS_SUSPEND_RESUME, sp.WRITE_DAC):
+            assert sp.can_open(child.pid, access) == (False, sp.ERROR_ACCESS_DENIED), hex(access)
+        child.kill()
+        assert child.wait(10) != 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+
+
 def test_maybe_harden_never_in_tests_or_when_off(settings, monkeypatch):
     called = []
     monkeypatch.setattr(sp, "harden_process", lambda: called.append(1) or True)
@@ -440,7 +461,7 @@ def test_a_subfolder_opened_by_its_own_entry_is_found_and_reset(tmp_path, store)
     assert (s.root / ".locked").exists() and (sub / "item.bin").read_bytes() == b"x"
 
 
-def test_forced_lock_keeps_the_marker_when_icacls_fails(tmp_path, monkeypatch):
+def test_forced_lock_keeps_the_marker_when_the_lock_fails(tmp_path, monkeypatch):
     s = Settings(data_dir=str(tmp_path / "locked-data"))
     s.root.mkdir(parents=True)
     secure_root(s)
@@ -449,18 +470,60 @@ def test_forced_lock_keeps_the_marker_when_icacls_fails(tmp_path, monkeypatch):
     assert secure_root(s) == "Data folder already locked to your account and administrators."
     calls = []
 
-    class Failed:
-        returncode, stdout, stderr = 5, "", "Access is denied."
-
-    def failing_run(cmd, **kw):
-        calls.append(cmd)
-        return Failed()
-    monkeypatch.setattr(subprocess, "run", failing_run)
+    def failing_lock(path):
+        calls.append(path)
+        return 5                                                # ERROR_ACCESS_DENIED
+    monkeypatch.setattr(sp, "lock_folder", failing_lock)
     note = secure_root(s, force=True)
-    assert calls and note.startswith("Could not lock the data folder") and "Access is denied" in note
+    assert calls and note.startswith("Could not lock the data folder") and "error 5" in note
     assert marker.exists()                                      # still counts as "was locked"
     monkeypatch.undo()
     assert sp.relock_data_folder(s) is True and marker.exists()
+
+
+BACKUP_OPERATORS = "S-1-5-32-551"      # a real built-in group, not one of the "broad" ones
+
+
+def test_lock_takes_out_every_other_account(tmp_path, store):
+    """TGUARD-20261127-02: /grant:r used to keep other accounts' own entries."""
+    s = Settings(data_dir=str(tmp_path / "locked-data"))
+    s.root.mkdir(parents=True)
+    _icacls(s.root, "/grant", f"*{BACKUP_OPERATORS}:(OI)(CI)F")   # someone else's entry, there first
+    secure_root(s)
+    assert BACKUP_OPERATORS not in sp.folder_writer_sids(s.root)
+    assert sp.data_folder_open_to(s.root) == []
+    me = sp.current_user_sid()
+    assert set(sp.folder_writer_sids(s.root)) == {me, "S-1-5-18", "S-1-5-32-544"}
+    # added later: the self-check names it and locks it again
+    _icacls(s.root, "/grant", f"*{BACKUP_OPERATORS}:(OI)(CI)M")
+    assert sp.data_folder_open_to(s.root) == [sp.account_name(BACKUP_OPERATORS)]
+    assert "Backup Operators" in sp.account_name(BACKUP_OPERATORS)
+    (eid,) = sp.OwnWatch(s, store, installed=False).check()
+    assert "Backup Operators" in store.get_guard_event(eid)["message"]
+    assert sp.data_folder_open_to(s.root) == []
+
+
+def test_a_new_data_folder_is_locked_from_the_start(tmp_path):
+    s = Settings(data_dir=str(tmp_path / "fresh"))
+    assert not s.root.exists()
+    secure_root(s)
+    assert s.root.is_dir() and sp.data_folder_open_to(s.root) == []
+    assert sp.folder_owner_sid(s.root) == sp.current_user_sid()
+    assert sp.create_locked_folder(s.root) is False             # already there
+
+
+def test_a_data_folder_owned_by_another_account_is_refused(tmp_path, monkeypatch):
+    from tacoguard.config import DataFolderNotYours
+    s = Settings(data_dir=str(tmp_path / "theirs"))
+    s.root.mkdir(parents=True)
+    (s.root / ".locked").write_text("locked by TacoGuard\n", encoding="utf-8")   # even with the marker
+    monkeypatch.setattr(sp, "folder_owner_sid", lambda path: "S-1-5-21-1-2-3-1009")
+    with pytest.raises(DataFolderNotYours, match="belongs to another Windows account"):
+        secure_root(s)
+    assert sp.relock_data_folder(s) is False
+    # owned by Administrators (made by an elevated program of yours) is fine
+    monkeypatch.setattr(sp, "folder_owner_sid", lambda path: "S-1-5-32-544")
+    assert "locked" in secure_root(s).lower()
 
 
 def test_unlocked_folder_without_marker_is_left_alone(tmp_path, store):

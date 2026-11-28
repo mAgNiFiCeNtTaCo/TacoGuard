@@ -312,11 +312,47 @@ def test_stored_newer_root_wins(settings, monkeypatch, tmp_path):
     monkeypatch.setattr(S, "SHIPPED_ROOT", shipped)
     assert S.load_trusted_root(settings)["version"] == 1
     v2 = root_signed(2, [k], [tk])
-    S.remember(settings, v2, targets_signed(7, {}), b"raw")
+    S.remember(settings, v2, targets_signed(7, {}), b"raw", root_files=[doc(v2, [k])])
     assert S.load_trusted_root(settings)["version"] == 2
     state = S.load_state(settings)
     assert state["targets_version"] == 7 and state["targets_sha256"] == hashlib.sha256(b"raw").hexdigest()
     assert not list(Path(settings.updates_dir).glob("*.tmp"))
+
+
+def test_a_stored_root_is_checked_again_every_time(settings, monkeypatch, tmp_path):
+    """TGUARD-20261127-07: a newer key list written into trusted.json (or a stored root file
+    without the old keys' signatures) is never trusted on its own."""
+    k, tk = new_key(), new_key()
+    evil, evil_t = new_key(), new_key()
+    shipped = tmp_path / "root.json"
+    shipped.write_bytes(doc(root_signed(1, [k], [tk]), [k]))
+    monkeypatch.setattr(S, "SHIPPED_ROOT", shipped)
+    forged = root_signed(2, [evil], [evil_t])
+    S.save_state(settings, {"root": forged, "targets_version": 0})          # trusted.json edited
+    assert S.load_trusted_root(settings)["version"] == 1
+    S.write_bytes_atomic(S.stored_root_path(settings, 2), doc(forged, [evil]))   # signed by itself only
+    assert S.load_trusted_root(settings)["version"] == 1
+    S.write_bytes_atomic(S.stored_root_path(settings, 2), b"{ not json")
+    assert S.load_trusted_root(settings)["version"] == 1
+    # the real next root, signed by the old key and its own: trusted, and a gap stops the walk
+    v2 = root_signed(2, [k], [tk])
+    S.write_bytes_atomic(S.stored_root_path(settings, 2), doc(v2, [k]))
+    S.write_bytes_atomic(S.stored_root_path(settings, 4), doc(root_signed(4, [k], [tk]), [k]))
+    assert S.load_trusted_root(settings)["version"] == 2
+
+
+def test_the_updater_stores_the_root_files_it_walked(tmp_path, settings):
+    k1, k2, tk = new_key(), new_key(), new_key()
+    v1 = root_signed(1, [k1], [tk])
+    v2 = root_signed(2, [k2], [tk])
+    folder = tmp_path / "rel"
+    folder.mkdir()
+    (folder / "root-2.json").write_bytes(doc(v2, [k1, k2]))
+    (folder / "targets.json").write_bytes(doc(targets_signed(1, {}), [tk]))
+    walked = []
+    root, targets, _raw, changed = updater.fetch_verified_targets(sources.LocalFolderSource(folder), v1,
+                                                                  root_files=walked)
+    assert changed and root["version"] == 2 and walked == [doc(v2, [k1, k2])]
 
 
 def test_built_in_root_must_be_self_signed(settings, monkeypatch, tmp_path):

@@ -123,6 +123,43 @@ def test_restore_to_taken_name_and_missing_folder(q, store, tmp_path):
     assert q.restore(qid3) == str(folder / "sample (restored 2).exe")
 
 
+def test_restore_never_goes_through_a_folder_link(q, store, tmp_path):
+    """TGUARD-20261127-06: someone who can change the original folder swaps it for a junction to
+    another place; the restore is refused and the file stays in quarantine."""
+    import subprocess
+    folder = tmp_path / "Downloads" / "game"
+    p = make_sample(folder)
+    qid = q.put(str(p), "r", [])
+    elsewhere = tmp_path / "Startup"
+    elsewhere.mkdir()
+    shutil.rmtree(folder)
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(folder), str(elsewhere)], check=True,
+                   capture_output=True, creationflags=0x08000000)
+    try:
+        with pytest.raises(QuarantineError, match="is now a link to another place"):
+            q.restore(qid)
+        assert list(elsewhere.iterdir()) == []
+        assert store.get_quarantine(qid)["state"] == "quarantined"
+        # a link higher up counts too
+        os.rmdir(folder)
+        shutil.rmtree(tmp_path / "Downloads")
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(tmp_path / "Downloads"), str(elsewhere)], check=True,
+                       capture_output=True, creationflags=0x08000000)
+        with pytest.raises(QuarantineError, match="is now a link"):
+            q.restore(qid)
+        assert list(elsewhere.iterdir()) == []
+        # the plain folder back: the restore works
+        os.rmdir(tmp_path / "Downloads")
+        assert q.restore(qid) == str(p) and p.read_bytes() == samples.sample_bytes()
+    finally:
+        for link in (folder, tmp_path / "Downloads"):
+            try:
+                if os.path.lexists(link) and (os.lstat(link).st_reparse_tag or 0):
+                    os.rmdir(link)
+            except OSError:
+                pass
+
+
 def test_restore_with_trust_adds_allowlist(q, store, tmp_path):
     p = make_sample(tmp_path)
     digest = sha(p)
