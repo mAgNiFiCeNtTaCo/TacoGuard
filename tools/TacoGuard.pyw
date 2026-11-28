@@ -30,7 +30,15 @@ import time
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
-DEFAULT_DATA = (r"D:\TacoGuard" if os.path.isdir("D:\\") else  # same rule as tacoguard/config.py
+def _fixed_drive(root):
+    try:
+        return ctypes.windll.kernel32.GetDriveTypeW(root) == 3          # DRIVE_FIXED
+    except (AttributeError, OSError):
+        return False
+
+
+DEFAULT_DATA = (r"D:\TacoGuard"                                          # same rule as tacoguard/config.py
+                if os.path.isdir(r"D:\TacoGuard") or (os.path.isdir("D:\\") and _fixed_drive("D:\\")) else
                 os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local"),
                              "TacoGuard"))
 LOG_MAX = 1024 * 1024

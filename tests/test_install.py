@@ -224,6 +224,83 @@ def test_uninstall_keeps_data_and_removes_shortcut(installed, tmp_path):
     assert (s.quarantine_dir / "item.tgq").read_bytes() == b"encrypted"
 
 
+def test_setup_uninstall_step_through_the_launcher(installed, tmp_path):
+    """TacoGuard's Setup uninstaller runs `TacoGuard.pyw uninstall --root <app> --keep-files`: the
+    launcher and the venv redirector that started it don't count as "TacoGuard is running", the
+    files stay (Setup deletes them), and the data folder comes from the install marker."""
+    marker = json.loads((installed / inst.MARKER).read_text(encoding="utf-8"))
+    assert marker["data_dir"]
+    r = _run([installed / "venv" / "Scripts" / "python.exe", installed / "TacoGuard.pyw",
+              "uninstall", "--root", installed, "--keep-files"])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ready to be removed" in r.stdout and marker["data_dir"] in r.stdout
+    assert (installed / "current.json").is_file() and (installed / "venv").is_dir()
+
+
+def test_setup_uninstall_step_waits_for_a_running_copy(installed):
+    busy = subprocess.Popen([str(installed / "venv" / "Scripts" / "python.exe"), "-c",
+                             "import time; time.sleep(60)  # tacoguard"], creationflags=NO_WINDOW)
+    try:
+        deadline = time.time() + 30
+        while not inst.installed_copy_running(installed) and time.time() < deadline:
+            time.sleep(0.3)
+        r = _run([installed / "venv" / "Scripts" / "python.exe", installed / "TacoGuard.pyw",
+                  "uninstall", "--root", installed, "--keep-files"])
+        assert r.returncode == 3, r.stdout + r.stderr
+        assert "Quit" in r.stdout
+    finally:
+        busy.kill()
+
+
+def test_cli_root_is_the_normal_folder_only_without_the_test_variable(tmp_path, monkeypatch):
+    from tacoguard.__main__ import _chosen_root
+    monkeypatch.delenv("TACOGUARD_INSTALL_ROOT", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    normal = tmp_path / "Programs" / "TacoGuard"
+    assert _chosen_root(None) is None
+    assert _chosen_root(str(normal)) is None                  # start at sign-in + clean-up apply
+    assert _chosen_root(str(tmp_path / "other")) == (tmp_path / "other").resolve()
+    monkeypatch.setenv("TACOGUARD_INSTALL_ROOT", str(normal))   # tests: never the normal folder
+    assert _chosen_root(str(normal)) == normal.resolve()
+
+
+def test_install_step_arguments():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("install_step", ROOT / "tools" / "install_step.py")
+    step = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(step)
+    assert step.tacoguard_args(r"C:\x") == ["install", "--offline", "--root", r"C:\x"]
+    assert step.tacoguard_args(r"C:\x", r"C:\d", sign_in=False) == [
+        "--data", r"C:\d", "install", "--offline", "--root", r"C:\x", "--no-sign-in"]
+
+
+def test_data_folder_on_d_only_when_d_is_a_hard_disk(monkeypatch):
+    from tacoguard import config
+    real_isdir = os.path.isdir
+    monkeypatch.setattr(config.os.path, "isdir", lambda p: p == "D:\\" or (p != r"D:\TacoGuard" and real_isdir(p)))
+    monkeypatch.setattr(config, "_fixed_drive", lambda root: True)
+    assert config._default_data_dir() == r"D:\TacoGuard"
+    monkeypatch.setattr(config, "_fixed_drive", lambda root: False)          # a DVD or USB drive
+    assert config._default_data_dir().endswith(r"\TacoGuard") and not config._default_data_dir().startswith("D:")
+    monkeypatch.setattr(config.os.path, "isdir", lambda p: p in ("D:\\", r"D:\TacoGuard"))
+    assert config._default_data_dir() == r"D:\TacoGuard"                     # an existing folder is kept
+
+
+def test_installer_pieces():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("build_installer", ROOT / "tools" / "build_installer.py")
+    bi = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bi)
+    png = (ROOT / "tacoguard" / "web" / "static" / "icon.png").read_bytes()
+    ico = bi.png_to_ico(png)
+    assert ico[:6] == b"\0\0\1\0\1\0" and ico[22:] == png
+    with pytest.raises(ValueError):
+        bi.png_to_ico(b"GIF89a" + b"\0" * 30)
+    assert bi._left_out("Doc/html/index.html") and bi._left_out("Lib/tkinter/__init__.py")
+    assert bi._left_out("DLLs/_tkinter.pyd") and not bi._left_out("Lib/venv/__init__.py")
+    assert not bi._left_out("Lib/testing.py") and not bi._left_out("python.exe")
+
+
 def test_uninstall_refuses_folder_without_marker(tmp_path):
     root = tmp_path / "x"
     root.mkdir()

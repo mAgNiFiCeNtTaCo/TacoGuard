@@ -273,15 +273,36 @@ def _ml_test(zip_path: Path, self_test, say) -> None:
         self_test(dest)
 
 
-def publish(folder: Path, yes: bool = False, say=print) -> int:
+SETUP_NAME = re.compile(r"TacoGuard-Setup-\d{1,5}(\.\d{1,5}){1,3}\.exe")
+
+
+def setup_notes(setups: list[Path]) -> str:
+    """Release-note lines for TacoGuard's Setup files (tools/build_installer.py): name + SHA-256."""
+    lines = []
+    for p in setups:
+        lines.append(f"- `{p.name}`: SHA-256 `{_sha(p)}`")
+    if not lines:
+        return ""
+    return ("\n\nTo install TacoGuard, download the Setup file and run it (no administrator rights needed). "
+            "It is not code-signed, so Windows SmartScreen asks first: More info, then Run anyway.\n"
+            + "\n".join(lines))
+
+
+def publish(folder: Path, yes: bool = False, say=print, setups: list[Path] | None = None) -> int:
+    """setups: TacoGuard-Setup-<version>.exe files to attach as well (not part of the signed
+    update list; their SHA-256 goes in the release notes)."""
     folder = Path(folder)
     report = verify(folder, say=say)
+    setups = [Path(p) for p in setups or []]
+    for p in setups:
+        if not p.is_file() or not SETUP_NAME.fullmatch(p.name):
+            raise ReleaseError(f"{p} is not a TacoGuard-Setup-<version>.exe file.")
     tag = f"v{report['targets_version']}"
-    files = sorted(str(p) for p in folder.iterdir() if p.is_file())
+    files = sorted(str(p) for p in folder.iterdir() if p.is_file()) + [str(p) for p in setups]
     cmd = ["gh", "release", "create", tag, *files, "--repo", config.RELEASE_REPO,
            "--title", f"TacoGuard update {report['targets_version']}",
            "--notes", "Signed TacoGuard update. TacoGuard checks every file against targets.json "
-                      "before using it."]
+                      "before using it." + setup_notes(setups)]
     if not yes:
         say("Would run: " + " ".join(cmd[:4]) + f" ... ({len(files)} files) --repo {config.RELEASE_REPO}")
         say("Add --yes to publish. Publishing makes the release public to every TacoGuard install.")
@@ -309,6 +330,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("publish")
     p.add_argument("dir")
     p.add_argument("--yes", action="store_true")
+    p.add_argument("--setup", action="append", default=[],
+                   help="also attach this TacoGuard-Setup-<version>.exe (tools/build_installer.py)")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "build":
@@ -321,7 +344,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "verify":
             verify(Path(args.dir), Path(args.root) if args.root else None)
         else:
-            return publish(Path(args.dir), yes=args.yes)
+            return publish(Path(args.dir), yes=args.yes, setups=[Path(s) for s in args.setup])
     except (ReleaseError, keytool.KeyError_, signed.UpdateRejected, sources.SourceError,
             setup_fetch.FetchError) as e:
         print(str(e), file=sys.stderr)

@@ -9,6 +9,9 @@ Layout of config.install_root() (%LOCALAPPDATA%\\Programs\\TacoGuard):
     .tacoguard-install.json   marker: this folder belongs to TacoGuard (uninstall needs it)
     venv\\                     Python made from the same base interpreter as the one running the
                               installer, with exactly the parts listed in requirements.lock
+    runtime\\                  only when TacoGuard's Setup (installer\\TacoGuard.iss) made the copy:
+                              python.org's own Python, the base interpreter of venv\\. Setup runs
+                              tools\\install_step.py, which runs install() from its setup\\ folder
     requirements.lock         name==version of every part TacoGuard needs (pinned to the project's .venv)
     versions\\<version>\\       tacoguard\\ package (no tests, no __pycache__), licences, requirements.lock,
                               tacoguard-files.json (Phase 4: sha256 of every file + the launcher,
@@ -466,15 +469,28 @@ def prune_versions(root: Path, keep_old: int = KEEP_OLD_VERSIONS) -> list[str]:
     return removed
 
 
+def _me_and_my_starters() -> set[int]:
+    """This process and the processes that started it (the launcher, the venv's python.exe
+    redirector): an install or uninstall started through the installed copy is not "running"."""
+    import psutil
+    pids = {os.getpid()}
+    try:
+        pids.update(p.pid for p in psutil.Process().parents())
+    except (psutil.Error, OSError):
+        pass
+    return pids
+
+
 def installed_copy_running(root: Path | None = None) -> bool:
-    """True when a TacoGuard process runs from this install folder (server, scan worker)."""
+    """True when a TacoGuard process runs from this install folder (server, scan worker). This
+    process and the ones that started it don't count."""
     import psutil
     root = Path(root or install_root()).resolve()
     venv = os.path.normcase(str(root / "venv"))
     versions = os.path.normcase(str(root / "versions"))
-    me = os.getpid()
+    mine = _me_and_my_starters()
     for p in psutil.process_iter(["name", "pid"]):
-        if p.info["pid"] == me or not (p.info["name"] or "").lower().startswith("python"):
+        if p.info["pid"] in mine or not (p.info["name"] or "").lower().startswith("python"):
             continue
         try:
             cmd = os.path.normcase(" ".join(p.cmdline()))
@@ -539,7 +555,15 @@ def _site_packages(root: Path) -> Path:
 
 def _copy_parts(root: Path, pins: dict[str, str], progress) -> None:
     """Copy each pinned distribution's files from this Python into the installed one (offline)."""
-    dest_root = _site_packages(root)
+    copy_parts(_site_packages(root), pins, progress)
+
+
+def copy_parts(dest_root: Path, pins: dict[str, str], progress=None) -> None:
+    """Copy each pinned distribution's files (as its RECORD lists them, no scripts outside
+    site-packages, no __pycache__) from this Python into the folder `dest_root`. Also used by
+    tools/build_installer.py for the installer's parts."""
+    progress = progress or (lambda m: None)
+    dest_root = Path(dest_root)
     dest_root.mkdir(parents=True, exist_ok=True)
     for name, version in pins.items():
         dist = md.distribution(name)
@@ -748,8 +772,9 @@ def install(settings, project_root, shortcut: bool = False, *, deps: str = "pip"
         root.mkdir(parents=True, exist_ok=True)
         marker = read_json(root / MARKER) or {}
         marker.update({"app": "TacoGuard", "created": marker.get("created") or time.time(),
-                       "note": "Made by `python -m tacoguard install`. `python -m tacoguard uninstall` "
-                               "removes this folder; your data folder is kept."})
+                       "data_dir": str(settings.data_dir),
+                       "note": "Made by `python -m tacoguard install` (or TacoGuard's Setup). `python -m "
+                               "tacoguard uninstall` removes this folder; your data folder is kept."})
         write_json(root / MARKER, marker)
 
         # 1. TacoGuard's own Python with exactly the locked parts
@@ -869,12 +894,14 @@ def remove_hosts_leftover(settings, *, launcher=None, hosts_path=None) -> str:
 
 
 def uninstall(settings, *, root: Path | None = None, cleanup: bool | None = None,
-              autostart_key: str | None = None, hosts_launcher=None, hosts_path=None) -> dict:
+              autostart_key: str | None = None, hosts_launcher=None, hosts_path=None,
+              keep_files: bool = False) -> dict:
     """Remove the installed copy: only a folder carrying TacoGuard's marker, never the data
     folder or quarantine. cleanup (None = only for the default install folder) also removes the
     start-at-sign-in entry, the guard's decoy files and TacoGuard's block in Windows' hosts file
-    (one admin prompt; when you say No, the message gives the command for later). Returns
-    {"ok", "message"}."""
+    (one admin prompt; when you say No, the message gives the command for later). keep_files:
+    everything except deleting the folder (TacoGuard's Setup uninstaller deletes its files
+    itself). Returns {"ok", "message", "running"}."""
     if cleanup is None:
         cleanup = root is None
     root = Path(root or install_root())
@@ -888,8 +915,9 @@ def uninstall(settings, *, root: Path | None = None, cleanup: bool | None = None
         if _same_or_inside(keep, root) or _same_or_inside(root, keep):
             return {"ok": False, "message": f"The data folder {data} overlaps the install folder, so nothing was removed."}
     if installed_copy_running(root):
-        return {"ok": False, "message": "TacoGuard is running from the installed copy. Close it (Quit on the "
-                                        "page) and run uninstall again."}
+        return {"ok": False, "running": True,
+                "message": "TacoGuard is running from the installed copy. Close it (Quit on the page or "
+                           "the tray icon) and run uninstall again."}
     lnk = marker.get("shortcut")
     if lnk and Path(lnk).name == SHORTCUT_NAME and Path(lnk).is_file():
         try:
@@ -901,8 +929,11 @@ def uninstall(settings, *, root: Path | None = None, cleanup: bool | None = None
         note = remove_hosts_leftover(settings, launcher=hosts_launcher, hosts_path=hosts_path)
         if note:
             notes.append(note)
-    rmtree(root)
     extra = "".join(" " + n for n in notes)
+    if keep_files:
+        return {"ok": True, "message": f"TacoGuard is ready to be removed; Setup deletes the files in {root}. "
+                                       f"Your settings, scan history and quarantine in {data} are kept." + extra}
+    rmtree(root)
     if root.exists():
         return {"ok": False, "message": f"Some files in {root} could not be removed (in use?). Close TacoGuard "
                                         "and run uninstall again." + extra}

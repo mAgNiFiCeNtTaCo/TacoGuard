@@ -1,6 +1,6 @@
 """Where TacoGuard keeps its data, and its settings.
 
-The data folder defaults to D:\\TacoGuard (%LOCALAPPDATA%\\TacoGuard on a PC without a D: drive). Override it with the TACOGUARD_DATA environment
+The data folder defaults to D:\\TacoGuard (%LOCALAPPDATA%\\TacoGuard on a PC whose D: is no hard disk). Override it with the TACOGUARD_DATA environment
 variable or the --data command-line option (tests always use a temp folder).
 """
 from __future__ import annotations
@@ -11,10 +11,23 @@ import threading
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
+DRIVE_FIXED = 3
+
+
+def _fixed_drive(root: str) -> bool:
+    """True when `root` (e.g. "D:\\") is a hard disk, not a DVD, USB stick or network drive."""
+    try:
+        import ctypes
+        return ctypes.windll.kernel32.GetDriveTypeW(root) == DRIVE_FIXED
+    except (AttributeError, OSError):
+        return False
+
+
 def _default_data_dir() -> str:
-    """D:\\TacoGuard (keeps the system drive free); a PC without a D: drive uses
-    %LOCALAPPDATA%\\TacoGuard instead."""
-    if os.path.isdir("D:\\"):
+    """D:\\TacoGuard (keeps the system drive free) when D: is a hard disk or that folder already
+    exists; otherwise (no D:, or D: is a DVD / USB drive) %LOCALAPPDATA%\\TacoGuard.
+    tools/TacoGuard.pyw has the same rule."""
+    if os.path.isdir(r"D:\TacoGuard") or (os.path.isdir("D:\\") and _fixed_drive("D:\\")):
         return r"D:\TacoGuard"
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
     return os.path.join(base, "TacoGuard")

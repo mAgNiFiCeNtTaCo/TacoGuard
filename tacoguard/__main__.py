@@ -56,6 +56,23 @@ def hosts_command(settings, action: str, *, launcher=None, hosts_path=None, out=
     return 0 if getattr(res, "ok", False) else 1
 
 
+def _chosen_root(root):
+    """--root for install / uninstall: None (= the normal install folder, with start at sign-in
+    and the clean-up of start-up entries) when it names %LOCALAPPDATA%\\Programs\\TacoGuard;
+    any other folder (a test install) is used as given and never touches those."""
+    import os
+    from pathlib import Path
+
+    from .config import install_root
+    if not root:
+        return None
+    root = Path(root).resolve()
+    if not os.environ.get("TACOGUARD_INSTALL_ROOT") and \
+            os.path.normcase(str(root)) == os.path.normcase(str(install_root().resolve())):
+        return None
+    return root
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="tacoguard")
     ap.add_argument("--data", help="data folder (default D:\\TacoGuard or TACOGUARD_DATA)")
@@ -72,7 +89,13 @@ def main(argv: list[str] | None = None) -> int:
     p_inst.add_argument("--shortcut", action="store_true", help="also add a Start-menu shortcut")
     p_inst.add_argument("--offline", action="store_true",
                         help="copy the needed parts from this Python instead of downloading them with pip")
-    sub.add_parser("uninstall", help="remove the installed copy (your data folder is kept)")
+    p_inst.add_argument("--root", help="install folder (TacoGuard's Setup; default %%LOCALAPPDATA%%\\Programs\\TacoGuard)")
+    p_inst.add_argument("--no-sign-in", action="store_true",
+                        help="don't start TacoGuard when you sign in (saved in Settings)")
+    p_uninst = sub.add_parser("uninstall", help="remove the installed copy (your data folder is kept)")
+    p_uninst.add_argument("--root", help="install folder (TacoGuard's Setup)")
+    p_uninst.add_argument("--keep-files", action="store_true",
+                          help="clean up but leave the files (TacoGuard's Setup uninstaller deletes them)")
     p_hosts = sub.add_parser("hosts", help="TacoGuard's block in Windows' hosts file: status, or remove it")
     p_hosts.add_argument("action", choices=("status", "remove"))
     sub.add_parser("selftest", help="check that this copy of TacoGuard works (nothing is started)")
@@ -91,19 +114,31 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "hosts":
         return hosts_command(load_settings(args.data), args.action)
     if args.cmd in ("install", "uninstall", "selftest"):
+        from pathlib import Path
+
         from . import install as inst
-        settings = load_settings(args.data)
+        root = _chosen_root(getattr(args, "root", None))
+        data = args.data
+        if data is None and root is not None and args.cmd == "uninstall":
+            data = (inst.read_json(root / inst.MARKER) or {}).get("data_dir") or None
+        settings = load_settings(data)
         if args.cmd == "selftest":
             ok, lines = inst.selftest(settings)
             print("\n".join(lines))
             return 0 if ok else 1
         if args.cmd == "uninstall":
-            out = inst.uninstall(settings)
+            out = inst.uninstall(settings, root=root, keep_files=args.keep_files)
         else:
-            from pathlib import Path
+            if args.no_sign_in and settings.start_at_sign_in:
+                secure_root(settings)
+                settings.start_at_sign_in = False
+                settings.save()
             out = inst.install(settings, Path(__file__).resolve().parents[1], shortcut=args.shortcut,
-                               deps="copy" if args.offline else "pip", progress=lambda m: print(m, flush=True))
+                               deps="copy" if args.offline else "pip", root=root,
+                               progress=lambda m: print(m, flush=True))
         print(out["message"])
+        if out.get("running"):
+            return 3
         return 0 if out["ok"] else 1
 
     settings = load_settings(args.data)

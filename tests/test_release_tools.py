@@ -2,8 +2,10 @@
 real tacoguard/data/root.json, never GitHub)."""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -315,6 +317,29 @@ def test_publish_without_yes_does_not_run_gh(keydir, tmp_path, monkeypatch):
     assert R.publish(out, yes=False, say=lines.append) == 0
     assert any("Add --yes to publish" in x for x in lines)
     assert any(config.RELEASE_REPO in x for x in lines)
+
+
+def test_publish_attaches_setup_with_its_checksum(keydir, tmp_path, monkeypatch):
+    d, root_json, _ = keydir
+    out = tmp_path / "releases" / "001"
+    R.build(out, ml=_ml_package(tmp_path), keys_dir=d, shipped_root=root_json, say=_quiet,
+            self_test=lambda f: None)
+    monkeypatch.setattr(S, "SHIPPED_ROOT", root_json)
+    monkeypatch.setattr(R, "_ml_test", lambda *a: None)
+    setup = tmp_path / "dist" / "TacoGuard-Setup-0.4.3.exe"
+    setup.parent.mkdir()
+    setup.write_bytes(b"MZ not really a program")
+    ran = []
+    monkeypatch.setattr(R.subprocess, "run", lambda cmd, **k: ran.append(cmd) or subprocess.CompletedProcess(cmd, 0))
+    assert R.publish(out, yes=True, say=_quiet, setups=[setup]) == 0
+    cmd = ran[0]
+    assert str(setup) in cmd
+    notes = cmd[cmd.index("--notes") + 1]
+    assert hashlib.sha256(setup.read_bytes()).hexdigest() in notes and "Run anyway" in notes
+    other = tmp_path / "dist" / "something.exe"
+    other.write_bytes(b"x")
+    with pytest.raises(R.ReleaseError, match="not a TacoGuard-Setup"):
+        R.publish(out, yes=True, say=_quiet, setups=[other])
 
 
 def test_secret_looking_files_stop_the_app_build(tmp_path):

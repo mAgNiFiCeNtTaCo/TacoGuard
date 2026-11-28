@@ -111,6 +111,20 @@ shown. abuse.ch's data is free for not-for-profit use; TacoGuard never uses it t
 
 ## Getting started
 
+Download `TacoGuard-Setup-<version>.exe` from the
+[Releases page](https://github.com/mAgNiFiCeNtTaCo/TacoGuard/releases) and run it. It needs no
+administrator rights and Python comes with it. Setup is not code-signed, so Windows SmartScreen
+says "Windows protected your PC": click **More info**, then **Run anyway**. Each release lists the
+file's SHA-256 so you can check you got the right one.
+
+Setup puts TacoGuard in `%LOCALAPPDATA%\Programs\TacoGuard` (no service), with its own copy of
+python.org's Python, and adds a Start-menu entry. It also asks whether TacoGuard should start
+quietly when you sign in (one entry in your account's Run key), so real-time protection is on
+whenever you are; you can change that in Settings later. To remove TacoGuard, use Windows'
+**Installed apps**. Your data folder (settings, scan history, quarantine) stays.
+
+### From the source code
+
 You need Python 3.14 (Python 3.12 or newer works).
 
 ```
@@ -120,12 +134,9 @@ py -3.14 -m venv .venv
 .venv\Scripts\python.exe -m tacoguard install --shortcut
 ```
 
-`install` puts a copy of TacoGuard in `%LOCALAPPDATA%\Programs\TacoGuard` (no administrator
-rights, no service) and, with `--shortcut`, a Start-menu entry. It also makes TacoGuard start
-quietly when you sign in (one entry in your account's Run key), so real-time protection is on
-whenever you are; switch that off in Settings.
-Self-update works only on this installed copy. Start it from the Start menu, or run
-`%LOCALAPPDATA%\Programs\TacoGuard\TacoGuard.pyw`.
+`install` puts the same installed copy in `%LOCALAPPDATA%\Programs\TacoGuard` and, with
+`--shortcut`, a Start-menu entry. Self-update works only on the installed copy. Start it from the
+Start menu, or run `%LOCALAPPDATA%\Programs\TacoGuard\TacoGuard.pyw`.
 
 The page opens in your browser at http://127.0.0.1:8799. Only this PC, and only your Windows
 account, can use it. The first time, press **Get signatures**. It downloads the ClamAV program
@@ -188,7 +199,8 @@ kept to fall back on.
 ## Your data folder
 
 `D:\TacoGuard` holds the settings, signatures, the ML model, the results database and the
-quarantine. On a PC without a D: drive it is `%LOCALAPPDATA%\TacoGuard` instead. Change it with the `--data` option or the `TACOGUARD_DATA` environment variable.
+quarantine. When D: is not a hard disk (no D: drive, or D: is a DVD or USB drive) it is
+`%LOCALAPPDATA%\TacoGuard` instead. Change it with the `--data` option or the `TACOGUARD_DATA` environment variable.
 
 ## Licenses
 
@@ -201,3 +213,5 @@ Tests: `.venv\Scripts\python.exe -m pip install -e .[test]` then `.venv\Scripts\
 The only test material is in `tests/samples.py`: the EICAR test string (built in memory, never
 written to disk) and harmless files carrying a test marker. Never add real malware samples.
 Release tools: `tools/keys.py` (signing keys) and `tools/release.py` (build, verify, publish).
+Setup: `tools/build_installer.py [--test]` (needs Inno Setup 6; `--test` installs it silently into
+a temp folder, checks it and uninstalls it again).
